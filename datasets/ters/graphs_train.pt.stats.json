@@ -1,0 +1,42 @@
+{
+  "split": "train.h5",
+  "n_total": 6254,
+  "n_kept": 6254,
+  "survival_rate": 1.0,
+  "n_fallback": 5,
+  "n_molecules_with_aromatics": 5376,
+  "geometry": {
+    "n_molecules": 6254,
+    "elements": {
+      "1": 52070,
+      "6": 56429,
+      "7": 11114,
+      "8": 11481
+    },
+    "n_atoms": {
+      "min": 2,
+      "median": 20.0,
+      "p95": 31.0,
+      "max": 40
+    },
+    "centred_radius": {
+      "max": 10.44362274174646,
+      "p95": 6.627904188431824
+    },
+    "max_abs_z": 3.196516413507717,
+    "nn_distance": {
+      "min": 0.7614499926567078,
+      "median": 1.0949940499787172,
+      "p95": 1.399385572297149
+    },
+    "bond_length": {
+      "n": 270848,
+      "median": 1.35458425476457,
+      "max": 1.8670735304317487
+    },
+    "suggested_pos_norm": 7,
+    "suggested_spatial_cut_off": 0.0737,
+    "suggested_spatial_cut_off_angstrom": 1.9,
+    "suggested_spatial_cut_off_note": "squared, in units of (A / pos_norm=7); equals 1.90 A in real space"
+  }
+}

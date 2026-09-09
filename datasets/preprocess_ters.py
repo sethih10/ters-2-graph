@@ -85,10 +85,19 @@ def build_xyz_block(atomic_numbers, atom_pos):
 
 
 # Cordero (2008) covalent radii in Angstrom -- the same values ``ase.data.covalent_radii``
-# carries, vendored for H/C/N/O so this script runs in environments without ``ase`` (the im2g
-# venv has rdkit but not ase). ASE is still preferred when importable so that a dataset
-# containing an unexpected element is handled rather than rejected.
-_COVALENT_RADII_HCNO = {1: 0.31, 6: 0.76, 7: 0.71, 8: 0.66}
+# carries, vendored so this script runs in environments without ``ase`` (the im2g venv has
+# rdkit but not ase). ASE is still preferred when importable so that a dataset containing an
+# unexpected element is handled rather than rejected.
+# --- ADDED (stm): F/Si/P/S/Cl/Br ------------------------------------------------------
+# The STM corpus contains all ten of these (measured, docs/05-progress-log.md 2026-09-08),
+# so on that data the H/C/N/O-only table would have made ``ase`` a hard requirement and
+# turned every fallback-path molecule into an ImportError. Widened rather than replaced:
+# the values for H/C/N/O are unchanged, so the TERS path cannot shift.
+_COVALENT_RADII = {
+    1: 0.31, 6: 0.76, 7: 0.71, 8: 0.66,                       # TERS set, unchanged
+    9: 0.57, 14: 1.11, 15: 1.07, 16: 1.05, 17: 1.02, 35: 1.20,  # STM additions
+}
+_COVALENT_RADII_HCNO = _COVALENT_RADII      # back-compat alias; nothing else referenced it
 
 
 def _covalent_radius(z):
@@ -97,11 +106,11 @@ def _covalent_radius(z):
         return float(covalent_radii[int(z)])
     except ImportError:
         try:
-            return _COVALENT_RADII_HCNO[int(z)]
+            return _COVALENT_RADII[int(z)]
         except KeyError:
             raise ImportError(
                 f'covalent radius for Z={int(z)} needs `pip install ase` -- only '
-                f'{sorted(_COVALENT_RADII_HCNO)} are vendored') from None
+                f'{sorted(_COVALENT_RADII)} are vendored') from None
 
 
 def covalent_bond_fallback(mol, atomic_numbers, atom_pos, tolerance=1.15):
@@ -168,7 +177,7 @@ def mol_from_geometry(atomic_numbers, atom_pos, allow_fallback=True, charge=0):
     return mol, used_fallback, n_aromatic
 
 
-def encode_graph(mol, h5_index):
+def encode_graph(mol, h5_index, types=None):
     """REUSE of the encoding convention at datasets/qm9s_dataset.py:226-260.
 
     Deviation from docs/03-execution-plan.md: ``fc`` carries RDKit's assigned formal
@@ -180,6 +189,14 @@ def encode_graph(mol, h5_index):
     from rdkit import Chem
     from rdkit.Chem.rdchem import BondType as BT
 
+    # --- ADDED (stm): element set is now a parameter ----------------------------------
+    # Defaults to the module-level H/C/N/O map, so every existing TERS call site is
+    # byte-for-byte unaffected. Parameterised rather than copied into preprocess_stm.py:
+    # the STM corpus has ten elements, and a second copy of this function would be a
+    # second place for the (row * N + col) edge ordering to drift out of sync with
+    # datasets/qm9s_dataset.py:258.
+    types = TYPES if types is None else types
+
     bonds = {BT.SINGLE: 1, BT.DOUBLE: 2, BT.TRIPLE: 3, BT.AROMATIC: 4}  # 0 -> no edge
 
     n = mol.GetNumAtoms()
@@ -188,9 +205,10 @@ def encode_graph(mol, h5_index):
     type_idx, charges, formal_charges = [], [], []
     for atom in mol.GetAtoms():
         z = atom.GetAtomicNum()
-        if z not in TYPES:
-            raise ValueError(f'element Z={z} outside the H/C/N/O set')
-        type_idx.append(TYPES[z])
+        if z not in types:
+            raise ValueError(
+                f'element Z={z} outside the configured set {sorted(types)}')
+        type_idx.append(types[z])
         charges.append(z)
         formal_charges.append(atom.GetFormalCharge())
 
@@ -388,7 +406,7 @@ def geometry_stats(records):
     )
 
 
-def check_record(rec, expect_aromatic_free=True):
+def check_record(rec, expect_aromatic_free=True, types=None):
     """Assert an encoded record is well formed. Raises AssertionError with a reason.
 
     The last check is the important one: it pushes the record through the *real*
@@ -397,13 +415,15 @@ def check_record(rec, expect_aromatic_free=True):
     reaching the transform is silently erased, so an aromatic molecule would come out of
     this check with fewer edges than it has bonds.
     """
+    types = TYPES if types is None else types       # --- ADDED (stm): see encode_graph
     n = int(rec['num_atom'])
     ei, et = rec['edge_index'], rec['edge_type']
 
     assert rec['pos'].shape == (n, 3), f"pos {tuple(rec['pos'].shape)} != ({n}, 3)"
     assert rec['atom_type'].shape == (n,), 'atom_type length != num_atom'
     assert rec['fc'].shape == (n,), 'fc length != num_atom'
-    assert int(rec['atom_type'].max()) < len(TYPES), 'atom_type index outside H/C/N/O'
+    assert int(rec['atom_type'].max()) < len(types), \
+        f'atom_type index outside the configured {len(types)}-element set'
     assert ei.shape[1] == et.shape[0], 'edge_index and edge_type disagree'
     assert ei.shape[1] % 2 == 0, 'odd edge count -- edges must be stored both directions'
     assert int(ei.max()) < n if ei.numel() else True, 'edge_index refers to a missing atom'
@@ -427,7 +447,7 @@ def check_record(rec, expect_aromatic_free=True):
                 edge_index=ei, edge_type=et)
     # atom_type stores indices, so the list is the encoder's *values* --
     # matches the call site at datasets/build_dataset.py:24
-    data = EdgeComSpectraTransform(list(range(len(TYPES))), include_aromatic=False)(data)
+    data = EdgeComSpectraTransform(list(range(len(types))), include_aromatic=False)(data)
 
     n_exist = int(data.edge_one_hot[..., 0].sum())
     assert n_exist == ei.shape[1], (

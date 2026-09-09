@@ -62,7 +62,12 @@ module load python-pytorch/2.10
 export PYTHONPATH="$HOME/.cache/ters-overlay:$SLURM_SUBMIT_DIR"
 cd "$SLURM_SUBMIT_DIR"
 
-WORKDIR="exp/ters_$(date +%Y%m%d)_${SLURM_JOB_ID}"
+# Checkpoints are ~660 MB each and a run keeps 5+, so ~3.7 GB per run. $HOME is a 15 GB
+# quota and was at 14 GB when this default was changed -- a run writing there dies on quota
+# partway through, which is how ters-ae lost job 989420. Default to /scratch (250 GB, 180-day
+# cleanup); override with TERS_WORKDIR to put a run somewhere else.
+WORKDIR="${TERS_WORKDIR:-/scratch/project_2001912/ters-runs/ters_$(date +%Y%m%d)_${SLURM_JOB_ID}}"
+mkdir -p "$(dirname "$WORKDIR")"
 
 echo "=============================================================="
 echo "job      : $SLURM_JOB_NAME ($SLURM_JOB_ID)"

@@ -35,6 +35,10 @@ def get_dataset(config, transform=True):
     if config.data.name == 'TERS':
         return _build_ters(config, transform, dataset_info)
 
+    # --- ADDED (stm): STM splits are on disk too, same five-tuple contract -----------------
+    if config.data.name == 'STM':
+        return _build_stm(config, transform, dataset_info)
+
     if config.data.name == 'QM9S':
         dataset = QM9SDataset(config.data.root, transform=transform, spectra_version=config.data.spectra_version)
     else:
@@ -97,6 +101,45 @@ def _build_ters(config, transform, dataset_info):
     return train, train, val, test, dataset_info
 
 
+def _build_stm(config, transform, dataset_info):
+    """--- ADDED (stm): three StmGraphDataset splits, one per HDF5 file.
+
+    Same five-tuple contract and the same reasoning as ``_build_ters`` above: splitting is
+    already done on disk (one HDF5 + one sidecar per split), so ``index_select`` and
+    ``get_cond_idx_split`` -- ``InMemoryDataset`` APIs a lazily-read HDF5 dataset does not
+    have -- are deliberately bypassed.
+
+    Config keys (see configs/diffspectra_stm.py):
+        data.root        directory holding {train,val,test}.h5
+        data.graph_root  directory holding graphs_{split}.pt   (default: data.root)
+        data.stm_key     cube dataset name inside the split group  (default: X)
+        data.load_cubes  read the image cubes at all           (default: True)
+    """
+    import os.path as osp
+    from .stm_dataset import StmGraphDataset
+
+    root = config.data.root
+    graph_root = getattr(config.data, 'graph_root', root)
+    cube_key = getattr(config.data, 'stm_key', 'X')
+    load_cubes = getattr(config.data, 'load_cubes', True)
+
+    def split(name):
+        return StmGraphDataset(
+            h5_path=osp.join(root, f'{name}.h5'),
+            graphs_path=osp.join(graph_root, f'graphs_{name}.pt'),
+            # Passed explicitly rather than inferred: the group inside train.h5 happens to
+            # be named 'train', but relying on that would break silently on a file whose
+            # group is named differently, and the caller always knows the split here.
+            split=name,
+            transform=transform,
+            load_cubes=load_cubes,
+            cube_key=cube_key,
+        )
+
+    train, val, test = split('train'), split('val'), split('test')
+    return train, train, val, test, dataset_info
+
+
 def inf_iterator(iterable):
     iterator = iterable.__iter__()
     while True:
@@ -115,8 +158,18 @@ def get_dataloader(train_ds, val_ds, test_ds, config):
         raise ValueError(f"Model {config.model.name} not recognized.")
 
     is_ters = config.data.name == 'TERS'
+    # --- ADDED (stm): STM takes the same cube path as TERS, different collate --------------
+    is_stm = config.data.name == 'STM'
 
-    if is_ters:
+    if is_stm:
+        if config.only_2D:
+            raise ValueError('only_2D has no STM collate; the z-stack conditions 3D positions.')
+        collate_fn = CollateStm(
+            aug_rotation=aug_rotation,
+            aug_translation=aug_translation,
+            aug_translation_scale=config.data.aug_translation_scale
+        )
+    elif is_ters:
         if config.only_2D:
             raise ValueError('only_2D has no TERS collate; the cube conditions 3D positions.')
         collate_fn = CollateTers(
@@ -147,6 +200,12 @@ def get_dataloader(train_ds, val_ds, test_ds, config):
     # overriding it, and keep prefetch_factor=1 so the formula above stays easy to reason
     # about. Budget it before raising: at batch 64 and 16 workers this holds ~27 GiB.
     loader_kwargs = {}
+    # --- ADDED (stm): STM deliberately takes the `else` branch below ----------------------
+    # Not an oversight. The prefetch_factor=1 clamp above exists because a TERS cube is
+    # 256x256x100 float32 = 26.2 MB; an STM z-stack is 128x128x14 = 917 KB, 28x smaller, so
+    # at batch 128 / 8 workers / default prefetch 2 the in-flight cubes are ~1.9 GiB of the
+    # ~211 GiB a reserved GH200 gets. Clamping prefetch there would throttle the loader for
+    # no reason. STM still honours config.data.num_workers, because `else` reads it directly.
     if is_ters:
         num_workers = getattr(config.data, 'num_workers', 2)
         if num_workers > 0:
@@ -550,9 +609,14 @@ class CollateTers(CollateSpectra):
                          aug_translation=aug_translation,
                          aug_translation_scale=aug_translation_scale)
 
+    # --- ADDED (stm): which attribute holds the cube -------------------------------------
+    # A class constant rather than a constructor argument: it is a property of the modality,
+    # not of a run, and get_dataloader picks the class already.
+    cube_attr = 'ters'
+
     def __call__(self, items):
         items = [(item.atom_one_hot, item.edge_one_hot, item.fc, item.pos, item.num_atom,
-                  item.ters) for item in items]
+                  getattr(item, self.cube_attr)) for item in items]
         atom_one_hot, edge_one_hot, formal_charges, positions, num_atoms, ters = zip(*items)
 
         atom_one_hot, edge_one_hot, formal_charges, positions, node_mask, edge_mask = \
@@ -569,6 +633,26 @@ class CollateTers(CollateSpectra):
             edge_mask=edge_mask,
             context=torch.stack(ters, dim=0)
         )
+
+
+class CollateStm(CollateTers):
+    """--- ADDED (stm): STM z-stack conditioning.
+
+    Identical to ``CollateTers`` but for which attribute carries the cube, because the
+    contract downstream is identical: one dense ``(C, H, W)`` tensor per molecule stacked
+    into ``context``. Subclassed rather than copied for the same reason ``CollateTers``
+    subclasses ``CollateSpectra`` -- ``pad_and_mask`` and ``augment_positions`` encode the
+    mask conventions the whole pipeline depends on.
+
+    .. note::
+       ``aug_rotation`` must stay False for STM. The cube is a *constant-height* stack over
+       a fixed surface, so rotating the 3D coordinates without rotating the image stack
+       would break the correspondence the conditioning relies on. ``get_dataloader`` sets it
+       False for every DMT run, so this is a note rather than a guard -- but it is the first
+       thing to check if augmentation is ever turned on.
+    """
+
+    cube_attr = 'stm'
 
 
 class CollateSpectr2D(object):

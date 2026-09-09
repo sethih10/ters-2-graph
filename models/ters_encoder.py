@@ -88,18 +88,29 @@ class TersEncoder(nn.Module):
     output_dim : int
         Must equal ``config.model.nf`` -- ``cond_lin`` is ``Linear(hidden_dim, time_dim)``
         (models/dmt.py:262).
+    pool_size : int
+        Spatial grid kept by the head before flattening.  ``1`` is the original global
+        average pool.  ``k > 1`` keeps a ``k x k`` map, so coarse spatial layout survives
+        into the conditioning vector instead of being averaged away -- see
+        docs/experimental.md (E-1).  Output width is unchanged either way, so nothing
+        downstream of ``cond_lin`` moves; only the head's Linear grows, by
+        ``filters[-1] * (pool_size^2 - 1) * output_dim`` parameters.
     """
 
     def __init__(self, in_channels=100, filters=(64, 128, 256, 512),
-                 kernel_size=(3, 3, 3, 3), output_dim=256, n_groups=8):
+                 kernel_size=(3, 3, 3, 3), output_dim=256, n_groups=8, pool_size=1):
         super().__init__()
         if len(kernel_size) != len(filters):
             raise ValueError(
                 f'filters and kernel_size must be the same length, '
                 f'got {len(filters)} and {len(kernel_size)}')
 
+        if pool_size < 1:
+            raise ValueError(f'pool_size must be >= 1, got {pool_size}')
+
         self.in_channels = in_channels
         self.output_dim = output_dim
+        self.pool_size = pool_size
 
         # 1x1 stem: mixes the spectral channels at full spatial resolution before any
         # spatial convolution.  With 100 input channels this is where most of the input
@@ -113,10 +124,15 @@ class TersEncoder(nn.Module):
         ])
         self.pool = nn.MaxPool2d(2, 2)
 
+        # AdaptiveAvgPool2d fixes the OUTPUT grid, so any H,W still works and the cube size
+        # need not be known -- that property is what pool_size inherits.  At pool_size=1 this
+        # is the original global average pool, which is spatially invariant: it reduces the
+        # 256x256 map to one number per channel, so *where* a mode lights up cannot reach the
+        # denoiser.  pool_size=k keeps a k x k grid instead.  See docs/experimental.md (E-1).
         self.head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),          # any H,W -> 1x1, so cube size need not be known
+            nn.AdaptiveAvgPool2d(pool_size),
             nn.Flatten(),
-            nn.Linear(filters[-1], output_dim),
+            nn.Linear(filters[-1] * pool_size * pool_size, output_dim),
         )
         # Mirrors SpecFormer.out_norm (models/specformer.py:67).  Keep it: cond_lin was
         # initialised for a LayerNorm-scaled input, and handing it raw pooled activations

@@ -19,17 +19,45 @@ truth is genuinely flat; the out-of-plane RMS printed on every 3D panel says whe
 model reproduced that.
 """
 import argparse, os, pickle
+
+# --- ADDED (stm): output paths resolve to /scratch, never inside the repo ($HOME is a
+# 15 GB quota and one run is 3.7 GB). Both import forms, because these are run BOTH as
+# `python3 tools/x.py` (sibling import) and as `python3 -m tools.x` (package import).
+try:
+    from paths import generated
+except ImportError:
+    from tools.paths import generated
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the 3d projection)
 
-from datasets.datasets_config import ters_hcno
+from datasets.datasets_config import get_dataset_info
 
-COLORS = ters_hcno['colors_dic']        # H, C, N, O
-RADII = ters_hcno['radius_dic']
-DECODER = ters_hcno['atom_decoder']
+# --- ADDED (stm): element tables come from the dataset info, not a fixed 4-element list ---
+# These were `ters_hcno['colors_dic']` etc., which is 4 entries (H/C/N/O). The STM corpus has
+# 10, so `COLORS[a]` raised IndexError on the first Cl/Br atom -- a crash, thankfully, rather
+# than a silently mis-coloured plot. Set by --info-name so the same script renders either
+# corpus; the default keeps TERS behaviour byte-for-byte.
+COLORS, RADII, DECODER = None, None, None
+
+
+def set_palette(info_name):
+    global COLORS, RADII, DECODER
+    info = get_dataset_info(info_name)
+    COLORS = info['colors_dic']
+    RADII = info['radius_dic']
+    DECODER = info['atom_decoder']
+    if not (len(COLORS) == len(RADII) == len(DECODER)):
+        raise ValueError(
+            f'{info_name}: colors_dic/radius_dic/atom_decoder disagree '
+            f'({len(COLORS)}/{len(RADII)}/{len(DECODER)}) -- a plot would mislabel elements')
+
+
+CUBE_LABEL = 'TERS cube'          # --- ADDED (stm): overridden by --info-name below
+
+set_palette('ters_hcno')          # import-time default, unchanged from before
 BOND_LW = {1: 1.6, 2: 2.8, 3: 3.8, 4: 2.2}
 
 
@@ -107,7 +135,16 @@ def figure(geo, scores, split, mode, path):
             sp.set_edgecolor('#BBBBBB')
         ax.set_ylabel(f"#{sc['ds_index']}", fontsize=9, color='#333')
         if rank == 0:
-            ax.set_title('TERS cube\n(sum over 100 ch)', fontsize=9, color='#111')
+            # --- ADDED (stm): name the modality and the REAL channel count. Was hardcoded
+            # 'TERS cube / sum over 100 ch', which on an STM z-stack mislabels both the
+            # modality and the depth (14 slices, not 100 channels) -- a caption that is
+            # confidently wrong is worse than none on a figure that gets pasted into a note.
+            # cube_sum is already summed over channels, so the count only exists if the
+            # sampler recorded it; older payloads have no 'n_channels' key. Omit rather
+            # than guess -- an unlabelled panel beats a wrong channel count.
+            n_ch = geo.get('n_channels')
+            ax.set_title(f'{CUBE_LABEL}\n(sum over {n_ch} ch)' if n_ch else CUBE_LABEL,
+                         fontsize=9, color='#111')
         # --- column 1: ground truth ------------------------------------------------------
         t = geo['truth'][mi]
         proj = '3d' if mode == '3d' else None
@@ -129,7 +166,7 @@ def figure(geo, scores, split, mode, path):
     handles = [plt.Line2D([], [], marker='o', ls='', markersize=8, markerfacecolor=COLORS[i],
                           markeredgecolor='#222', label=DECODER[i]) for i in range(len(DECODER))]
     fig.legend(handles=handles, loc='lower center', ncol=4, frameon=False, fontsize=9)
-    fig.suptitle(f'{split.upper()} — TERS cube → predicted geometry ({mode.upper()}), '
+    fig.suptitle(f'{split.upper()} — {CUBE_LABEL} → predicted geometry ({mode.upper()}), '
                  f'rows ranked best to worst', fontsize=12, y=.995)
     fig.tight_layout(rect=[0, .025, 1, .975])
     fig.savefig(path, dpi=150, facecolor='white')
@@ -138,9 +175,15 @@ def figure(geo, scores, split, mode, path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--dir', default='exp/ters_20260828_925597/generated')
+    ap.add_argument('--dir', default=generated('ters-runs/ters_20260828_925597'))
     ap.add_argument('--splits', nargs='+', default=['test', 'val'])
+    ap.add_argument('--info-name', default='ters_hcno',
+                    help='datasets_config entry supplying the element palette '
+                         "(use 'stm_10elem' for the STM corpus)")
     args = ap.parse_args()
+    set_palette(args.info_name)          # --- ADDED (stm)
+    global CUBE_LABEL
+    CUBE_LABEL = 'STM z-stack' if args.info_name == 'stm_10elem' else 'TERS cube'
     figdir = os.path.join(args.dir, 'figures'); os.makedirs(figdir, exist_ok=True)
     with open(os.path.join(args.dir, 'summary.pkl'), 'rb') as f:
         summary = pickle.load(f)

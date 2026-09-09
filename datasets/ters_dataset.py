@@ -63,6 +63,8 @@ class TersGraphDataset(Dataset):
     See docs/02-reuse-map.md 7.
     """
 
+    cube_attr = 'ters'          # --- ADDED (stm): overridden by StmGraphDataset
+
     def __init__(self, h5_path, graphs_path, channels_key='channels_100',
                  transform=None, normalize=True, load_cubes=True):
         import h5py
@@ -71,7 +73,15 @@ class TersGraphDataset(Dataset):
         self.graphs_path = graphs_path
         self.channels_key = channels_key
         self.transform = transform
-        self.normalize = NormalizeVectorized() if normalize else None
+        # --- ADDED (stm): accept a callable normaliser, not only a bool -------------------
+        # STM z-stacks need a different transform (per-cube, not per-channel -- the TERS one
+        # deletes their decay envelope; see models/stm_encoder.NormalizeStmCube). Accepting a
+        # callable lets StmGraphDataset subclass this instead of copying 120 lines of
+        # fork-safe HDF5 access. `True`/`False` behave exactly as before.
+        if callable(normalize):
+            self.normalize = normalize
+        else:
+            self.normalize = NormalizeVectorized() if normalize else None
         self.load_cubes = load_cubes
 
         # The sidecar holds RDKit Mol objects under 'rdmol', so it is not a weights-only
@@ -134,7 +144,13 @@ class TersGraphDataset(Dataset):
         # num_nodes is inferred by PyG from pos, which EdgeComSpectraTransform relies on at
         # datasets/build_dataset.py:130.  Setting pos (done in the sidecar) is sufficient.
         ters = torch.from_numpy(np.asarray(cube)).float().permute(2, 0, 1).contiguous()
-        data.ters = ters if self.normalize is None else self.normalize(ters)
+        # --- ADDED (stm): attribute name is a class constant ------------------------------
+        # So a subclass can store the cube under its own name and CollateStm can read it.
+        # Rejected reusing the name 'ters' for STM cubes: it would make CollateTers work
+        # with zero changes, but every downstream `data.ters` would then be lying about
+        # which modality it holds.
+        setattr(data, self.cube_attr, ters if self.normalize is None
+                else self.normalize(ters))
 
         return data if self.transform is None else self.transform(data)
 

@@ -14,6 +14,14 @@ NEW   : the truth/sample pairing and the legend strings.
 Writes into <dir>/figures/ as PNG, with SVG alongside as a vector fallback.
 """
 import argparse, os, pickle
+
+# --- ADDED (stm): output paths resolve to /scratch, never inside the repo ($HOME is a
+# 15 GB quota and one run is 3.7 GB). Both import forms, because these are run BOTH as
+# `python3 tools/x.py` (sibling import) and as `python3 -m tools.x` (package import).
+try:
+    from paths import generated
+except ImportError:
+    from tools.paths import generated
 from rdkit import Chem, RDLogger
 from rdkit.Chem import Draw, AllChem
 from rdkit.Chem.Draw import rdMolDraw2D
@@ -67,7 +75,7 @@ def grid_for_split(rows, path_png, path_svg, sub=(380, 300)):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--dir', default='exp/ters_20260828_925597/generated')
+    ap.add_argument('--dir', default=generated('ters-runs/ters_20260828_925597'))
     ap.add_argument('--splits', nargs='+', default=['test', 'val'])
     args = ap.parse_args()
     figdir = os.path.join(args.dir, 'figures')

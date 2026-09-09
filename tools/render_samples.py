@@ -10,6 +10,14 @@ than Tanimoto does:
   * heavy-atom canonical SMILES match -- did it find the actual molecule?
 """
 import argparse, base64, io, json, os, pickle
+
+# --- ADDED (stm): output paths resolve to /scratch, never inside the repo ($HOME is a
+# 15 GB quota and one run is 3.7 GB). Both import forms, because these are run BOTH as
+# `python3 tools/x.py` (sibling import) and as `python3 -m tools.x` (package import).
+try:
+    from paths import generated
+except ImportError:
+    from tools.paths import generated
 import numpy as np
 from rdkit import Chem, RDLogger
 from rdkit.Chem import AllChem, Draw, DataStructs
@@ -53,13 +61,17 @@ def svg(mol, size=(260, 210), label=''):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--dir', default='exp/ters_20260828_925597/generated')
+    ap.add_argument('--dir', default=generated('ters-runs/ters_20260828_925597'))
     ap.add_argument('--splits', nargs='+', default=['test', 'val'])
+    ap.add_argument('--tag', default='',
+                    help="Suffix of the sample files to score, e.g. '_shuf' for the "
+                         "shuffled-cube null control written by sample_ters --shuffle-cubes. "
+                         "Outputs are suffixed to match so a null never overwrites a matched run.")
     args = ap.parse_args()
 
     summary = {}
     for split in args.splits:
-        with open(os.path.join(args.dir, f'mols_{split}.pkl'), 'rb') as f:
+        with open(os.path.join(args.dir, f'mols_{split}{args.tag}.pkl'), 'rb') as f:
             d = pickle.load(f)
         n_mols, n_samp = d['n_mols'], d['n_samples']
         rows = []
@@ -103,14 +115,14 @@ def main():
               f"formula matches {sum(r['n_formula'] for r in rows)}/{len(allt)}, "
               f"exact {sum(r['n_exact'] for r in rows)}/{len(allt)}")
 
-    with open(os.path.join(args.dir, 'rescored.json'), 'w') as f:
+    with open(os.path.join(args.dir, f'rescored{args.tag}.json'), 'w') as f:
         json.dump({k: [{kk: vv for kk, vv in r.items() if kk not in ('truth_svg',)
                         and kk != 'samples'} | {'samples': [{k2: v2 for k2, v2 in s.items()
                                                              if k2 != 'svg'} for s in r['samples']]}
                        for r in v] for k, v in summary.items()}, f, indent=2)
-    with open(os.path.join(args.dir, 'summary.pkl'), 'wb') as f:
+    with open(os.path.join(args.dir, f'summary{args.tag}.pkl'), 'wb') as f:
         pickle.dump(summary, f)
-    print(f'\nwrote {args.dir}/rescored.json and summary.pkl')
+    print(f'\nwrote {args.dir}/rescored{args.tag}.json and summary{args.tag}.pkl')
 
 
 if __name__ == '__main__':

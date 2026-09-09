@@ -32,11 +32,26 @@ from models.ema import ExponentialMovingAverage
 from utils import get_data_scaler
 
 
+# --- ADDED (stm): which config pair to probe -------------------------------------------
+# Was hardcoded to the TERS pair. A module-level pair rather than an argument threaded through
+# probe() because every caller wants the same pair for a whole sweep, and --config sets it once
+# in main(). Default is unchanged, so an existing `probe_batch_size.py --sizes ...` invocation
+# probes exactly what it used to.
+CONFIG_PAIRS = {
+    'ters': ('configs.diffspectra_ters', 'configs.base_ters'),
+    'stm': ('configs.diffspectra_stm', 'configs.base_stm'),
+}
+_PAIR = 'ters'
+
+
 def build_config(batch_size, num_workers=None):
     """A fresh config at one batch size. ConfigDict from get_config() is unlocked,
     unlike the one main.py hands absl (lock_config=True), so this can be mutated."""
-    from configs.diffspectra_ters import get_config
-    from configs.base_ters import get_config as get_config_orig
+    import importlib
+
+    main_mod, orig_mod = CONFIG_PAIRS[_PAIR]
+    get_config = importlib.import_module(main_mod).get_config
+    get_config_orig = importlib.import_module(orig_mod).get_config
 
     config = get_config()
     config.training.batch_size = batch_size
@@ -101,11 +116,17 @@ def main():
                     help='comma-separated per-process batch sizes to try')
     ap.add_argument('--steps', type=int, default=4,
                     help='training steps per size; step 0 is discarded as warmup')
+    ap.add_argument('--config', default='ters', choices=sorted(CONFIG_PAIRS),
+                    help='which config pair to probe (default: ters)')
     ap.add_argument('--workers', default=None,
                     help='comma-separated DataLoader worker counts. When given, batch is '
                          'held at the FIRST value of --sizes and workers are swept instead '
                          '-- the useful sweep once the loader is known to be the bottleneck.')
     args = ap.parse_args()
+
+    global _PAIR
+    _PAIR = args.config
+    print(f'probing config pair: {_PAIR}  ({CONFIG_PAIRS[_PAIR][0]})')
 
     if not torch.cuda.is_available():
         raise SystemExit('no CUDA device visible -- submit this to gputest, do not run it '

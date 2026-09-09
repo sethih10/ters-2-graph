@@ -135,6 +135,11 @@ def get_config():
     #       because SpecFormer weights cannot match a conv trunk (see the change manifest).
     model.ters_in_channels = 100         # TERS: must equal TersGraphDataset.in_channels
     model.ters_filters = [64, 128, 256, 512]
+    # E-1 (docs/experimental.md). 1 = the original global average pool, which averages the
+    # 256x256 map to one number per channel and so cannot carry spatial layout. 4 keeps a
+    # 4x4 grid. Output width is unchanged, so nothing downstream of cond_lin moves.
+    # Override without editing: --config.model.ters_pool_size=1
+    model.ters_pool_size = 4
     model.pretrained_ters_encoder_path = ''      # empty = train the encoder from scratch
 
     # # loss function

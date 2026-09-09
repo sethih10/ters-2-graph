@@ -19,9 +19,15 @@ module load python-pytorch/2.10
 export PYTHONPATH="$HOME/.cache/ters-overlay:$SLURM_SUBMIT_DIR"
 cd "$SLURM_SUBMIT_DIR"
 
+# Checkpoint under test. Defaults to the E-1 control (the Aug-28 pool_size=1 run) so an
+# unset invocation reproduces the numbers already on record; override to point at another
+# arm, e.g.  sbatch --export=ALL,TERS_CKPT=/scratch/.../checkpoint_5.pth  docs/experimental.md
+CKPT="${TERS_CKPT:-exp/ters_20260828_925597/checkpoints/checkpoint_5.pth}"
+echo "ckpt : $CKPT"
+
 
 # Answers "is the model using the cube at all?" without needing sampling.py (D-8).
 python -m tools.diagnose_conditioning \
-    --ckpt exp/ters_20260828_925597/checkpoints/checkpoint_5.pth \
+    --ckpt $CKPT \
     --batches 4 --seeds 5
 echo "finished : $(date -Is)"

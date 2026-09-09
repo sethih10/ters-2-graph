@@ -9,6 +9,8 @@ from torch_scatter import scatter
 import functools
 from .specformer import SpecFormer
 from .ters_encoder import TersEncoder
+# --- ADDED (stm): STM z-stack conditioning encoder ------------------------------------
+from .stm_encoder import StmEncoder
 
 
 def modulate(x, shift, scale):
@@ -260,7 +262,14 @@ class DMT(nn.Module):
         # Implement conditioning encoder.  Both branches honour the same contract -- a
         # (B, output_dim) vector for cond_lin -- so nothing downstream of line 349 changes.
         self.spectra_version = getattr(config.data, 'spectra_version', None)
-        self.cond_encoder_kind = 'ters' if config.data.name == 'TERS' else 'specformer'
+        # --- ADDED (stm): route data.name == 'STM' to its own encoder ---------------------
+        # A third kind rather than folding STM into 'ters'. Rejected reusing the TERS branch
+        # with ters_in_channels=14: it runs -- the tensor contract is identical -- but TERS
+        # channels are unordered spectral bins while STM channels are ordered constant-height
+        # z-slices, so the 1x1 spectral stem has no inductive bias for the axis that carries
+        # the height information. See models/stm_encoder.py for the measurement.
+        _cond_kinds = {'TERS': 'ters', 'STM': 'stm'}
+        self.cond_encoder_kind = _cond_kinds.get(config.data.name, 'specformer')
 
         if self.cond_encoder_kind == 'ters':
             # TERS conditions on an image cube, not 1-D spectra.  See docs/02-reuse-map.md 4.
@@ -268,6 +277,22 @@ class DMT(nn.Module):
                 in_channels=config.model.ters_in_channels,
                 filters=tuple(getattr(config.model, 'ters_filters', (64, 128, 256, 512))),
                 output_dim=hidden_dim,
+                # Default 1 = the original global average pool, so an existing config that
+                # does not set this key trains exactly the run it used to.  docs/experimental.md
+                pool_size=getattr(config.model, 'ters_pool_size', 1),
+            )
+        elif self.cond_encoder_kind == 'stm':
+            # --- ADDED (stm): every knob getattr-defaulted, so an STM config only has to set
+            # data.name and (if the corpus differs) stm_in_channels. Nothing downstream of
+            # cond_lin moves -- output_dim is hidden_dim exactly as in the other two branches.
+            self.cond_encoder = StmEncoder(
+                # = len(f[split].attrs['z_slices']); 14 for /scratch/project_2001912/stm-data.
+                in_channels=getattr(config.model, 'stm_in_channels', 14),
+                conv3d_channels=tuple(getattr(config.model, 'stm_conv3d_channels',
+                                              (4, 8, 16))),
+                filters=tuple(getattr(config.model, 'stm_filters', (64, 128, 256))),
+                output_dim=hidden_dim,
+                pool_size=getattr(config.model, 'stm_pool_size', 1),
             )
         else:
             self.cond_encoder = SpecFormer(patch_len=config.model.patch_len, stride=config.model.stride, output_dim=hidden_dim, spectra_version=config.data.spectra_version)
@@ -291,6 +316,16 @@ class DMT(nn.Module):
                 self.load_pretrained_ters_encoder(ters_ckpt)
             else:
                 print("Train TersEncoder from scratch")
+        elif self.cond_encoder_kind == 'stm':
+            # --- ADDED (stm): same refuse-loudly rule as the TERS branch above. SpecFormer
+            # weights cannot fit a 3D conv stem, so loading would match zero keys and train
+            # from scratch while the log claimed otherwise.
+            if specformer_ckpt:
+                raise ValueError(
+                    'config.model.pretrained_specformer_path is set but the STM encoder is '
+                    'a 3D conv trunk, not a SpecFormer -- no key would match. Clear it to '
+                    'train from scratch.')
+            print("Train StmEncoder from scratch")
         elif specformer_ckpt:
             print("Load pretrained SpecFormer")
             self.load_pretrained_specformer(specformer_ckpt)

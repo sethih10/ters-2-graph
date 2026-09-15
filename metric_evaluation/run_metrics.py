@@ -11,7 +11,8 @@ means.
 
     per-pair metrics   compute_metrics.py           (upstream DiffSpectra definitions)
     top-k + null       tools/paper_metrics.py       (aggregation upstream cannot express)
-    generation         tools/sample_ters.py         (modality-aware: TERS cubes or STM z-stacks)
+    generation         tools/sample_cond.py         (modality-aware: TERS cubes or STM z-stacks)
+    distributional     tools/eval_cond.py           (FCD/SNN/Frag/Scaf/IntDiv + stability)
 
 Why the protocol is what it is
 ------------------------------
@@ -27,7 +28,7 @@ and neither is arbitrary:
     count changes the granularity and quietly makes the two tables incomparable.
 
 **Half the cells are nulls, and that is the load-bearing half.** The sampler is handed the true
-atom count (sample_ters.py:98) and the chemical space is narrow, so a Tanimoto in isolation
+atom count (sample_cond.py:98) and the chemical space is narrow, so a Tanimoto in isolation
 reports mostly the prior. `--shuffle-cubes` pairs each target with another molecule's cube (a
 derangement); the matched-minus-shuffled gap is the part attributable to the measurement.
 A null that scores well above zero means the protocol leaked, not that the model is good.
@@ -63,7 +64,8 @@ CELLS = [
 
 def sample_cmd(args, split, shuffled, out_dir):
     cfg, cfg_q = CONFIGS[args.modality]
-    cmd = [sys.executable, 'tools/sample_ters.py',
+    cmd = [sys.executable, 'tools/sample_cond.py',
+           '--modality', args.modality,
            '--ckpt', args.ckpt,
            '--config', cfg, '--config-qm9', cfg_q,
            '--split', split,
@@ -107,7 +109,7 @@ def main():
                     help='subset of cells to run (default: all four)')
     ap.add_argument('--batch-mols', type=int, default=0,
                     help='targets per generation batch (0 = all at once). Required above ~20 '
-                         'targets or generation OOMs -- see sample_ters --batch-mols.')
+                         'targets or generation OOMs -- see sample_cond --batch-mols.')
     ap.add_argument('--no-geometry', action='store_true',
                     help='skip the per-target geometry payload (only the figures use it)')
     ap.add_argument('--no-mces', action='store_true',
@@ -129,13 +131,16 @@ def main():
     os.chdir(REPO)                      # every command below uses repo-relative config paths
 
     # --- 1. sample -----------------------------------------------------------------------
-    scored = []
+    scored, processed = [], []
     for name, split, shuffled in wanted:
         out_dir = os.path.join(args.out, name)
-        # sample_ters names its output mols_<split>[_shuf].pkl; each cell gets its own
+        # sample_cond names its output mols_<split>[_shuf].pkl; each cell gets its own
         # directory so the matched and shuffled runs of the same split cannot collide.
         pkl = os.path.join(out_dir, f'mols_{split}{"_shuf" if shuffled else ""}.pkl')
         scored.append(f'{args.modality}_{name}={pkl}')
+        # ADDED (eval): the tensor tuples, for stage 3.
+        processed.append(os.path.join(
+            out_dir, f'processed_{split}{"_shuf" if shuffled else ""}.pkl'))
 
         cmd = sample_cmd(args, split, shuffled, out_dir)
         if args.dry_run:
@@ -150,11 +155,21 @@ def main():
         os.makedirs(out_dir, exist_ok=True)
         subprocess.run(cmd, check=True)
 
-    # --- 2. score ------------------------------------------------------------------------
+    # --- 2. score: similarity to the target ------------------------------------------------
     cmd = score_cmd(args, scored)
+    # ADDED (eval): every cell in one invocation, because the reference sets (a walk over the
+    # 184157-molecule train split, plus MOSES intermediate statistics) do not depend on the
+    # cell -- so building them four times would be pure waste. MEASURED at 34 s, not the
+    # "dominates the cost" this was first written assuming (job 1228484). Deliberately passed
+    # no flags: eval_cond's defaults ARE the full-reference protocol, and a smoke run with
+    # --max-ref, or --cache, belongs in a direct call to it.
+    eval_c = [sys.executable, 'tools/eval_cond.py', '--samples'] + processed
+
     if args.dry_run:
         print('# score all cells together (one table, nulls beside their matched cell)')
-        print('  ' + ' '.join(cmd))
+        print('  ' + ' '.join(cmd) + '\n')
+        print('# distributional metrics: FCD/SNN/Frag/Scaf/IntDiv + stability, all cells at once')
+        print('  ' + ' '.join(eval_c))
         return
 
     missing = [s.split('=', 1)[1] for s in scored if not os.path.exists(s.split('=', 1)[1])]
@@ -163,6 +178,21 @@ def main():
 
     print(f'\n{"=" * 90}\n== scoring {len(scored)} cells\n{"=" * 90}', flush=True)
     subprocess.run(cmd, check=True)
+
+    # --- 3. score: the sample distribution -------------------------------------------------
+    # Non-fatal on purpose. Stage 2 is the headline table and has already been printed and
+    # written by this point; killing the run because a reference set could not be built would
+    # throw away results that cost a full generation pass.
+    missing = [p for p in processed if not os.path.exists(p)]
+    if missing:
+        print(f'\nskipping distributional metrics: no processed pickle at {missing}. '
+              f'These come from tools/sample_cond.py; a run made by the pre-rename '
+              f'sample_ters.py does not have them and needs regenerating.')
+    else:
+        print(f'\n{"=" * 90}\n== distributional metrics, {len(processed)} cells'
+              f'\n{"=" * 90}', flush=True)
+        subprocess.run(eval_c, check=False)
+
     print(f'\noutputs under {args.out}')
 
 

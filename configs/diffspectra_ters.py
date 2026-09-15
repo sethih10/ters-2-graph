@@ -217,14 +217,23 @@ def get_config():
     # of snapshot_freq. eval.begin_ckpt below must stay in step with it.
     training.snapshot_freq = 5000 // training.num_gpus
     training.snapshot_freq_for_preemption = 2000 // training.num_gpus
-    # TERS: True -> False. MUST stay False until sampling.py grows a TERS branch. That file
-    # has no cube support whatsoever: sampling.py:158 reads `config.data.spectra_version` by
-    # direct attribute access (not getattr), which this config deliberately does not define,
-    # and `context` at sampling.py:206-219 is only ever assigned inside the uv/ir/raman/
-    # allspectra branches -- so even after adding the key, context would be unbound.
+    # TERS: True -> False. MUST stay False until sampling.py grows a cube branch. Defect D-8
+    # is still OPEN -- evaluation was moved into tools/, it was not fixed here. Four separate
+    # things break on this path, each surfacing only after the one before it:
+    #   1. sampling.py:159 and :364 read `config.data.spectra_version` by DIRECT attribute
+    #      access (not getattr), and this config deliberately does not define it;
+    #   2. `context` (sampling.py:206-219, :414-427) is only assigned inside the
+    #      uv/ir/raman/allspectra branches, so even after adding the key it is unbound;
+    #   3. sampling.py:204 calls `mol.num_atom.item()`, but the TERS sidecar stores num_atom
+    #      as a plain int (datasets/preprocess_ters.py:233), not a tensor;
+    #   4. sampling.py:227 iterates `range(batch_size)` over a possibly shorter `n_nodes`.
     # With this True the run dies at the first snapshot (step 5000//num_gpus, ~1 h in), NOT
     # at startup, which is exactly the kind of failure that wastes a 36 h allocation.
     # Checkpoints are still written on the same schedule; only in-run generation is skipped.
+    #
+    # Evaluate after training instead -- that path is complete and never touches sampling.py:
+    #   python -m tools.sample_cond --modality ters --ckpt <ckpt> --split test ...
+    #   python -m tools.eval_cond   --samples <out>/processed_test.pkl
     training.snapshot_sampling = False
 
     # --- ADDED (wandb) ------------------------------------------------------------------

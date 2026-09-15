@@ -50,6 +50,27 @@ def check_stability(positions, atom_type, dataset_info, debug=False):
             elif 'Geom' in dataset_info['name']:
                 order = geom_predictor(
                     (atom_decoder[pair[0]], atom_decoder[pair[1]]), dist)
+            # --- ADDED (eval): the image-cube corpora. Purely additive -- the two branches
+            # above and the raise below are untouched, so the QM9S path is unaffected.
+            #
+            # `bonds1` already tabulates every element these corpora contain: ters_hcno is
+            # H/C/N/O, stm_10elem is H,C,N,O,F,Si,P,S,Cl,Br (bond_analyze.py:5-35).
+            # check_exists=True returns 0 for a pair with no tabulated length instead of
+            # raising KeyError, so an unexpected element degrades to "no bond" rather than
+            # killing an eval run that already cost a full ancestral sampling pass.
+            #
+            # CAVEAT, and it must travel with every number this produces: margin1/2/3 were
+            # tuned to maximise the stability of *QM9 true samples* (bond_analyze.py:119-120),
+            # i.e. on H/C/N/O/F only. For Si, P, S, Cl and Br the thresholds are uncalibrated,
+            # so 3D stability here is a RELATIVE signal across checkpoints of the same corpus
+            # and is NOT comparable to a published QM9 stability figure. The 2D metric stays
+            # authoritative: these models set pred_edge=True, so bond orders are predicted by
+            # the network and check_2D_stability reads them directly rather than re-deriving
+            # them from geometry. Falsifier for the caveat, and the way to retire it: run this
+            # over GROUND-TRUTH structures from the train split; if their 3D stability is not
+            # near 1.0, the margins are wrong for this corpus.
+            elif dataset_info['name'] in ('TERS', 'STM'):
+                order = get_bond_order(atom1, atom2, dist, check_exists=True)
             else:
                 raise ValueError('Fail to get dataset bond info.')
             nr_bonds[i] += order
@@ -119,7 +140,26 @@ def check_2D_stability(positions, atom_types, formal_charges, edge_types, datase
             order = edge_types[src, dst]
             mol.AddBond(src.item(), dst.item(), bond_list[int(order)])
 
-    if dataset_name not in ['GeomDrug', 'QM9']:
+    # --- ADDED (eval): closes D-11 (docs/05-progress-log.md:173-183). 'TERS' and 'STM' fell
+    # through to this early return, so every generation log to date printed
+    # `mol_stable 0.0, atom_stable 0.0` -- an early return, NOT a score, which is why those
+    # zeros coexisted with RDKit `Validity 0.96` on the same molecules. Verified on two
+    # hand-built stable molecules (CH3Cl, CH3Br) through mol_process: (0, 0, 5) before this
+    # line changed, (True, 5, 5) after.
+    #
+    # Nothing else is needed to make the block below correct for these corpora. It reads
+    # `allowed_fc_bonds` (bond_analyze.py:97-107), which already covers every element of
+    # stm_10elem -- H, C, N, O, F, Si, P, S, Cl, Br -- including the S and Br formal-charge
+    # states that stm_10elem['atom_fc_num'] records. ters_hcno is H/C/N/O, a subset.
+    #
+    # This is the allow-list fix docs/05-progress-log.md:181 proposes, taken in preference to
+    # the other option there (setting `'name': 'QM9'` in ters_hcno / stm_10elem). That
+    # alternative would also silently route check_stability's 3D dispatch above into the QM9
+    # branch, making the TERS/STM branch unreachable and re-hiding the margin caveat.
+    #
+    # Additive: 'GeomDrug' and 'QM9' behaviour is unchanged, and anything else still returns
+    # the zeros rather than a wrong number.
+    if dataset_name not in ['GeomDrug', 'QM9', 'TERS', 'STM']:
         return 0, 0, atom_num, mol
 
     # kekulize mol and iterate bonds for stability

@@ -25,8 +25,10 @@ import argparse, os, pickle
 # `python3 tools/x.py` (sibling import) and as `python3 -m tools.x` (package import).
 try:
     from paths import generated
+    from planarity import plane_project
 except ImportError:
     from tools.paths import generated
+    from tools.planarity import plane_project
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -61,15 +63,12 @@ set_palette('ters_hcno')          # import-time default, unchanged from before
 BOND_LW = {1: 1.6, 2: 2.8, 3: 3.8, 4: 2.2}
 
 
-def plane_project(pos):
-    """Project onto the molecule's own best-fit plane; also return out-of-plane RMS."""
-    c = pos - pos.mean(0)
-    if len(c) < 3:
-        return c[:, :2], 0.0
-    u, s, vt = np.linalg.svd(c, full_matrices=False)
-    xy = c @ vt[:2].T
-    oop = c @ vt[2]
-    return xy, float(np.sqrt((oop ** 2).mean()))
+# --- MOVED (planarity): `plane_project` now lives in tools/planarity.py -----------------
+# It was duplicated here and in tools/analyze_stm.py, and a third caller was about to make
+# it three. The function is imported above, unchanged -- same signature, same return, so
+# the `flat {oop:.2f} A` annotations below are byte-identical to before. That module also
+# carries the SMARTERS-compatible planarity percentages, and asserts in its own --self-test
+# that this out-of-plane RMS equals the SMARTERS `rmsd`.
 
 
 def draw_2d(ax, pos, atom_type, edges):
@@ -122,7 +121,7 @@ def figure(geo, scores, split, mode, path):
     ncol = 2 + ns
     fig = plt.figure(figsize=(2.35 * ncol, 2.5 * nm), facecolor='white')
     # Drive the layout off the SCORE records, never off geo's own ordering: the geometry
-    # pickle was ranked by the explicit-hydrogen Tanimoto that sample_ters.py computed, and
+    # pickle was ranked by the explicit-hydrogen Tanimoto that sample_cond.py computed, and
     # summary.pkl was re-ranked on heavy atoms. Indexing one by the other's rank silently
     # paired each molecule with a different molecule's scores.
     for rank, sc in enumerate(scores):

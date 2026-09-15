@@ -18,7 +18,7 @@
 #    Already done as of 2026-09-08: 184157 / 23067 / 23123 molecules kept
 #    (99.988% / 100% / 100%; the 23 train losses are hypervalent-Si valence errors).
 #
-# 2. Sanity-check the pipeline:  python3 -m tests.test_stm     # 47 checks
+# 2. Sanity-check the pipeline:  python3 -m tests.test_stm     # 73 checks
 #
 # ---------------------------------------------------------------------------
 # Everything below is MEASURED (gputest job 1134273, slurm/smoke_stm_gputest.sbatch)
@@ -42,8 +42,13 @@
 # 6 checkpoints = 3.4 GB. Do NOT lower it without re-checking `df -h /scratch` -- at 5000 it
 # would write 17.6 GB and fill the filesystem partway through the run.
 #
-# If cut short, resubmit with the SAME --workdir: run_lib.py:212 restores from
-# checkpoints-meta automatically.
+# If cut short, resubmit with the SAME workdir: run_lib.py:216 restores from
+# checkpoints-meta automatically.  export TERS_WORKDIR=<the old workdir> -- without it this
+# script mints a NEW dated workdir and silently trains from step 0.
+#
+# If checkpoints-meta/checkpoint.pth was lost (job 1134521 lost it to a quota-truncated
+# torch.save) but checkpoints/checkpoint_N.pth survived, copy one over it first: they are the
+# same format, optimizer and EMA included.  The preflight below then reports the resume step.
 
 #SBATCH --job-name=stm-train
 #SBATCH --account=project_2001912
@@ -90,15 +95,80 @@ done
 # 6 checkpoints x 587 MB + one 587 MB checkpoints-meta = ~4.1 GB. Refuse to start without
 # 6 GB, because running out of disk 8 h in loses the whole run (this is how ters-ae lost
 # job 989420, on $HOME quota rather than /scratch).
-AVAIL_GB=$(df -BG --output=avail /scratch/project_2001912 | tail -1 | tr -dc '0-9')
-echo "scratch free: ${AVAIL_GB} GiB (need ~4.1 for checkpoints)"
-[ "$AVAIL_GB" -ge 6 ] || { echo "REFUSING TO START: only ${AVAIL_GB} GiB free on /scratch"; exit 1; }
+#
+# NOT `df`: /scratch is a shared 6 PB Lustre filesystem, so df reports the whole device
+# (3.6 PB free on 2026-09-11) and this guard passed unconditionally. That is precisely why it
+# did not catch the PROJECT QUOTA that killed job 1134521 at step 88000 -- 250.5 G against a
+# 251 G hard limit, while df reported petabytes free. A df check is the wrong check on a
+# quota'd Lustre filesystem (docs/05-progress-log.md, 2026-09-09). The binding number is the
+# project's own allocation, which csc-workspaces reports.
+quota_avail_gb() {
+    if command -v csc-workspaces >/dev/null 2>&1; then
+        csc-workspaces 2>/dev/null | awk '
+            function gb(s,   n, u) {
+                n = s + 0; u = toupper(substr(s, length(s)))
+                if (u == "T") return n * 1024
+                if (u == "M") return n / 1024
+                if (u == "K") return n / 1048576
+                return n
+            }
+            $1 == "/scratch/project_2001912" && $2 ~ /\// {
+                split($2, q, "/"); printf "%d\n", gb(q[2]) - gb(q[1]); exit
+            }'
+        return
+    fi
+    # Fallback: Lustre group accounting. blimit reads 0 here (not Lustre-enforced), so the
+    # cap is the known 2 TB allocation rather than anything lfs reports.
+    lfs quota -g project_2001912 /scratch 2>/dev/null | awk '
+        $1 ~ /scratch/ && $2 ~ /^[0-9]+\*?$/ {
+            gsub(/\*/, "", $2); printf "%d\n", 2048 - ($2 / 1048576); exit
+        }'
+}
+AVAIL_GB=$(quota_avail_gb)
+if [ -z "$AVAIL_GB" ]; then
+    # A parse failure is not evidence of a full filesystem, so warn rather than refuse -- but
+    # say so loudly, because it means the run is going in unguarded.
+    echo "WARNING: could not read the project quota; starting WITHOUT a disk guard"
+else
+    echo "scratch quota free: ${AVAIL_GB} GiB (need ~4.1 for checkpoints)"
+    [ "$AVAIL_GB" -ge 6 ] || { echo "REFUSING TO START: only ${AVAIL_GB} GiB left of the project quota"; exit 1; }
+fi
 
-# Re-submitting with the SAME --workdir resumes rather than restarts.
+# Resume assertion. run_lib.py:216 restores from <workdir>/checkpoints-meta/checkpoint.pth and
+# starts from step 0 with only a log line if it is missing or unreadable -- so a resubmit meant
+# to resume can quietly repeat 16 h of work. Job 1134521 lost this file to a torch.save
+# truncated by the quota. Load it here, on the compute node, exactly the way utils.py:22 will
+# (weights_only=False included -- see the comment there).
+META="$WORKDIR/checkpoints-meta/checkpoint.pth"
+if [ -f "$META" ]; then
+    python3 -c '
+import sys, torch
+ck = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
+missing = [k for k in ("model", "optimizer", "ema", "step") if k not in ck]
+if missing:
+    sys.exit("RESUME FILE INCOMPLETE: missing %s" % missing)
+print("resume file OK -- training will continue from step %d" % int(ck["step"]))
+' "$META" || { echo "REFUSING TO START: $META is unreadable or incomplete. Copy a good checkpoints/checkpoint_N.pth over it to resume, or delete it to train from step 0."; exit 1; }
+else
+    echo "no resume file at $META -- training starts from step 0"
+fi
+
+# Re-submitting with the SAME workdir (export TERS_WORKDIR) resumes rather than restarts.
+#
+# The wandb run id defaults to a hash of the workdir (ters_wandb.py:198) so a preempted job
+# rejoins its own run. That is wrong when resuming from a checkpoint OLDER than the furthest
+# step the run already logged: wandb drops the replayed steps and the curve stalls. Set
+# TERS_WANDB_RUN_ID to give the resumed leg its own clean curve in the same project.
+WANDB_ARGS=()
+if [ -n "${TERS_WANDB_RUN_ID:-}" ]; then
+    WANDB_ARGS+=("--config.training.wandb.run_id=${TERS_WANDB_RUN_ID}")
+fi
+
 srun python3 main.py \
     --config configs/diffspectra_stm.py \
     --config_original_qm9 configs/base_stm.py \
     --mode train \
-    --workdir "$WORKDIR"
+    --workdir "$WORKDIR" \
+    ${WANDB_ARGS[@]+"${WANDB_ARGS[@]}"}
 
 echo "finished : $(date -Is)"

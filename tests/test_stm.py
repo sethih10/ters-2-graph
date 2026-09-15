@@ -18,6 +18,7 @@ not the TERS ones:
   [PLANTED] a constant cube              -- the zero-std guard.
 """
 
+import os
 import os.path as osp
 import shutil
 import tempfile
@@ -139,6 +140,47 @@ def tier_encoder():
     check('[PLANTED] NormalizeVectorized would destroy it (why the class exists)',
           float(ters_means.abs().max()) < 1e-4,
           f'{float(ters_means[0]):+.3f} -> {float(ters_means[-1]):+.3f}')
+
+    # --- ADDED (stm-clip): the pretrained encoder (models/stm_encoder_clip.py).
+    from models.stm_encoder_clip import (StmCubeEncoder, read_ckpt_geometry,
+                                         _self_test as clip_self_test)
+    check('clip encoder self-test (shapes, keys, strict loader)', clip_self_test())
+
+    clip = StmCubeEncoder(in_channels=N_Z, output_dim=256, pool_size=1)
+    yc = clip(x)
+    check('clip: contract (B,C,H,W) -> (B,256)', yc.shape == (2, 256), str(tuple(yc.shape)))
+
+    # [PLANTED] The state_dict names ARE the checkpoint. models/stm_encoder_v2.py's
+    # ResBlock3d is numerically identical to this file's but stores convs.N/norms.N, so
+    # "simplifying" the port to reuse it would silently stop the released weights loading.
+    # This is the assertion that catches that, with no checkpoint and no data.
+    keys = set(clip.state_dict())
+    check('[PLANTED] clip state_dict has the checkpoint\'s 64 keys, not v2\'s names',
+          len(keys) == 64 and 'stem3d.0.conv1.weight' in keys
+          and 'stem3d.0.convs.0.weight' not in keys,
+          f'{len(keys)} keys')
+    check('[PLANTED] the scale-guard buffer stays out of state_dict',
+          '_scale_checked' not in keys)
+    check('[PLANTED] clip head at pool_size=1 matches the released (256, 256)',
+          tuple(clip.state_dict()['head.2.weight'].shape) == (256, 256),
+          str(tuple(clip.state_dict()['head.2.weight'].shape)))
+
+    # The real artefact, when it is mounted. Skipped rather than failed off-cluster, because
+    # tier_encoder must stay runnable with no data and no scratch (docs/06 3).
+    from models.stm_encoder_clip import DEFAULT_CKPT
+    if os.path.exists(DEFAULT_CKPT):
+        geom = read_ckpt_geometry(DEFAULT_CKPT)
+        check('released checkpoint geometry is the shape we build',
+              geom['pool_size'] == 1 and geom['output_dim'] == 256
+              and geom['conv3d_channels'] == (4, 8, 16)
+              and geom['filters'] == (64, 128, 256), str(geom))
+        n_before = float(clip.state_dict()['to_2d.weight'].abs().sum())
+        from models.stm_encoder_clip import load_pretrained_stm_cube_encoder
+        load_pretrained_stm_cube_encoder(clip, DEFAULT_CKPT, verbose=False)
+        check('released checkpoint strict-loads all 64 tensors',
+              float(clip.state_dict()['to_2d.weight'].abs().sum()) != n_before)
+    else:
+        print(f'  SKIP  released checkpoint not mounted ({DEFAULT_CKPT})')
 
 
 def tier_preprocess(tmp, h5_dir, n_expected):
@@ -269,6 +311,90 @@ def tier_config(h5_dir, graph_dir):
     check('real batch -> finite conditioning vector',
           bool(torch.isfinite(v).all()) and v.shape[1] == model.cond_lin.out_features)
 
+    # --- v2 encoder (models/stm_encoder_v2.py) through the SAME config and the same batch.
+    # The point is the wiring, not the architecture: config.model.stm_encoder='v2' must pick
+    # a different class, and that class must consume the real batch and feed cond_lin, whose
+    # shape contract is what everything downstream depends on.
+    c2 = get_config()
+    c2.data.root, c2.data.graph_root = h5_dir, graph_dir
+    c2.training.batch_size = c2.training.eval_batch_size = 4
+    c2.data.num_workers = 0
+    c2.model.stm_encoder = 'v2'
+    m2 = DMT(c2)
+    check('stm_encoder="v2" builds StmEncoderV2',
+          type(m2.cond_encoder).__name__ == 'StmEncoderV2')
+    check('v2 is deeper in 3D than v1',
+          sum(1 for mod in m2.cond_encoder.modules()
+              if isinstance(mod, torch.nn.Conv3d) and mod.kernel_size != (1, 1, 1))
+          > sum(1 for mod in model.cond_encoder.modules()
+                if isinstance(mod, torch.nn.Conv3d) and mod.kernel_size != (1, 1, 1)))
+    with torch.no_grad():
+        v2 = m2.cond_lin(m2.cond_encoder(batch['context']))
+    check('v2: real batch -> finite conditioning vector of the same shape',
+          bool(torch.isfinite(v2).all()) and v2.shape == v.shape)
+
+    # v2 must NOT inherit v1's widths. The config sets stm_conv3d_channels=[4,8,16] for v1,
+    # so a shared knob name would build a "deep" encoder 12x too narrow and still call it v2
+    # -- the exact bug this namespacing exists to prevent.
+    check('v2 ignores v1 width knobs (stm_v2_* namespace)',
+          m2.cond_encoder.blocks_3d[-1].convs[-1].out_channels
+          == c2.model.stm_v2_conv3d_channels[-1],
+          f'{m2.cond_encoder.blocks_3d[-1].convs[-1].out_channels} vs '
+          f'{c2.model.stm_v2_conv3d_channels[-1]}')
+
+    # --- ADDED (stm-clip): the pretrained arm through the SAME config and batch.
+    c4 = get_config()
+    c4.data.root, c4.data.graph_root = h5_dir, graph_dir
+    c4.training.batch_size = c4.training.eval_batch_size = 4
+    c4.data.num_workers = 0
+    c4.model.stm_encoder = 'clip'
+    m4 = DMT(c4)
+    check('stm_encoder="clip" builds StmCubeEncoder',
+          type(m4.cond_encoder).__name__ == 'StmCubeEncoder')
+    with torch.no_grad():
+        v4 = m4.cond_lin(m4.cond_encoder(batch['context']))
+    check('clip: real batch -> finite conditioning vector of the same shape',
+          bool(torch.isfinite(v4).all()) and v4.shape == v.shape)
+
+    # clip must read stm_clip_*, never stm_* or stm_v2_*. pool_size is the sharp case: the
+    # config sets stm_pool_size=2 for v1 and stm_clip_pool_size=1 for this arm, and a shared
+    # name would build a head the released weights cannot load into.
+    check('clip ignores v1/v2 knobs (stm_clip_* namespace)',
+          m4.cond_encoder.pool_size == c4.model.stm_clip_pool_size
+          and m4.cond_encoder.pool_size != c4.model.stm_pool_size,
+          f'clip pool_size={m4.cond_encoder.pool_size}, '
+          f'stm_pool_size={c4.model.stm_pool_size}')
+    check('clip 2D widths come from stm_clip_filters',
+          m4.cond_encoder.blocks[-1].conv2.out_channels == c4.model.stm_clip_filters[-1])
+
+    # [PLANTED] A pretrained path on a NON-clip encoder must RAISE, not partially load.
+    # This checkpoint's 2D half is key- and shape-identical to v1's, so the repo's existing
+    # load_pretrained_ters_encoder would match 31 of v1's 40 tensors -- random 3D stem,
+    # random head -- and print "Loaded 31/40 tensors" without raising.
+    c5 = get_config(); c5.data.root, c5.data.graph_root = h5_dir, graph_dir
+    c5.model.stm_encoder = 'v1'
+    c5.model.pretrained_stm_encoder_path = '/nonexistent/cube_encoder_best.pt'
+    try:
+        DMT(c5)
+        check('[PLANTED] pretrained path on a non-clip encoder raises', False,
+              'it built something instead')
+    except ValueError as exc:
+        check('[PLANTED] pretrained path on a non-clip encoder raises',
+              'clip' in str(exc), str(exc)[:70])
+
+    # An unknown version must raise rather than silently falling back to v1.
+    # NOTE: the sentinel is deliberately NOT 'v3' any more -- 'clip' took the third slot and
+    # a future 'v3' would disarm this check by becoming a real value. 'v9' is unclaimed.
+    c3 = get_config(); c3.data.root, c3.data.graph_root = h5_dir, graph_dir
+    c3.model.stm_encoder = 'v9'
+    try:
+        DMT(c3)
+        check('an unknown stm_encoder value raises', False, 'it built something instead')
+    except ValueError as exc:
+        check('an unknown stm_encoder value raises',
+              'v1' in str(exc) and 'v2' in str(exc) and 'clip' in str(exc),
+              str(exc)[:70])
+
     # The TERS path must still build from the same code.
     from configs.diffspectra_ters import get_config as ters_config
     tc = ters_config()
@@ -344,6 +470,257 @@ def tier_real():
     ds.close()
 
 
+def tier_metrics():
+    """--- ADDED (eval): the evaluation path, which runs through tools/ and not sampling.py.
+
+    Synthetic only -- no checkpoint, no /scratch. What it guards is the pair of
+    ``evaluation/stability.py`` edits that made the metrics reachable for a cube corpus at
+    all, plus the ``mol_process`` switch in ``tools/sample_cond.py`` that feeds them.
+
+    The two planted pathologies here are both REGRESSIONS THAT PRINTED A NUMBER rather than
+    raising, which is the failure mode this project keeps hitting:
+
+      [PLANTED] a 3D metric that used to raise    -- 'Fail to get dataset bond info.' (D-8)
+      [PLANTED] a 2D stability that used to be 0  -- an early return, not a score (D-11)
+    """
+    print('\n=== Metrics (evaluation/stability.py, tools/) ===')
+    from datasets.datasets_config import get_dataset_info
+    from evaluation import get_edm_metric, get_2D_edm_metric
+    from evaluation.stability import check_stability, check_2D_stability
+    from sampling import mol_process
+
+    info = get_dataset_info('stm_10elem')
+
+    # CH3Cl and CH3Br: five atoms, every valence satisfied, and both contain an element the
+    # TERS H/C/N/O map does not have. stm_10elem indices are H0 C1 N2 O3 F4 Si5 P6 S7 Cl8 Br9.
+    B, N, A = 2, 5, 10
+    one_hot = torch.zeros(B, N, A)
+    pos = torch.zeros(B, N, 3)
+    fc = torch.zeros(B, N, 1)
+    edges = torch.zeros(B, N, N, dtype=torch.long)
+    geom = [(0, 0, 0), (1.78, 0, 0), (-.37, 1.03, 0), (-.37, -.51, .89), (-.37, -.51, -.89)]
+    for i, types in enumerate([[1, 8, 0, 0, 0], [1, 9, 0, 0, 0]]):
+        for j, (t, p) in enumerate(zip(types, geom)):
+            one_hot[i, j, t] = 1.0
+            pos[i, j] = torch.tensor(p)
+        for j in range(1, N):                      # single bonds from the carbon
+            edges[i, 0, j] = edges[i, j, 0] = 1
+
+    # tools/sample_cond.py must use mol_process, NOT mol_process_2D: the 2D variant sets
+    # pos=None (sampling.py:48) and the whole 3D suite is then impossible to run.
+    processed = mol_process(one_hot, pos, fc, [N, N], edges)
+    check('mol_process keeps positions (sample_cond feeds the 3D metric)',
+          len(processed[0]) == 4 and processed[0][0] is not None
+          and tuple(processed[0][0].shape) == (N, 3),
+          f'{len(processed[0])} fields, pos {tuple(processed[0][0].shape)}')
+
+    # [PLANTED] D-8: 'STM' used to fall past the QM9/Geom branches into a bare raise.
+    try:
+        stab_3d, rdkit_3d, _ = get_edm_metric(info)(processed)
+        ok_3d = True
+    except ValueError as exc:
+        stab_3d, rdkit_3d, ok_3d = {}, {}, False
+        check('[PLANTED] 3D metric runs for name="STM"', False, str(exc))
+    if ok_3d:
+        check('[PLANTED] 3D metric runs for name="STM" (was: Fail to get dataset bond info.)',
+              stab_3d['mol_stable'] == 1.0,
+              f"mol_stable={stab_3d['mol_stable']:.3f}")
+
+    # [PLANTED] D-11: 'STM' hit `return 0, 0` before the kekulize-and-count block, so every
+    # log printed mol_stable 0.0 beside a real Validity. Two fully-valent molecules must now
+    # score 1.0, and the atom count must be the real one rather than a placeholder.
+    stab_2d, rdkit_2d, mols_2d = get_2D_edm_metric(info)(processed)
+    check('[PLANTED] 2D stability is measured, not an early return (D-11)',
+          stab_2d['mol_stable'] == 1.0 and stab_2d['atom_stable'] == 1.0,
+          f"mol_stable={stab_2d['mol_stable']:.3f} atom_stable={stab_2d['atom_stable']:.3f}")
+    check('2D metric still reports validity for the same mols',
+          rdkit_2d['Validity'] == 1.0, f"Validity={rdkit_2d['Validity']:.3f}")
+    check('positions reach the rdkit mols (conformer attached)',
+          all(m.GetNumConformers() == 1 for m in mols_2d))
+
+    # Both edits are additive. QM9 must be untouched, and an unrecognised corpus must still
+    # fail loudly rather than silently scoring against the wrong bond table.
+    qm9 = get_dataset_info('qm9_with_h')
+    oh = torch.zeros(1, 5, 5); oh[0, 0, 1] = 1.0
+    mp = torch.tensor([[[0., 0, 0], [1.09, 0, 0], [-.36, 1.03, 0],
+                        [-.36, -.51, .89], [-.36, -.51, -.89]]])
+    me = torch.zeros(1, 5, 5, dtype=torch.long)
+    for j in range(1, 5):
+        oh[0, j, 0] = 1.0
+        me[0, 0, j] = me[0, j, 0] = 1
+    methane = mol_process(oh, mp, torch.zeros(1, 5, 1), [5], me)
+    check('QM9 3D branch unchanged (methane still stable)',
+          get_edm_metric(qm9)(methane)[0]['mol_stable'] == 1.0)
+    check('QM9 2D branch unchanged (methane still stable)',
+          get_2D_edm_metric(qm9)(methane)[0]['mol_stable'] == 1.0)
+
+    p = processed[0]
+    unknown = {'name': 'Nonesuch', 'atom_decoder': info['atom_decoder']}
+    try:
+        check_stability(p[0], p[1], unknown)
+        check('unknown corpus still raises in 3D', False, 'it returned instead')
+    except ValueError:
+        check('unknown corpus still raises in 3D', True)
+    check('unknown corpus still early-returns in 2D (not a wrong number)',
+          check_2D_stability(p[0], p[1], p[3], p[2],
+                             {**unknown, 'atom_fc_num': info['atom_fc_num']})[:2] == (0, 0))
+
+    # --- ADDED (scale): the parallel stability path must agree with the serial one EXACTLY.
+    # A parallel metric that disagrees with its serial version is worse than no metric, and the
+    # recombination is not trivial: the factory returns FRACTIONS, so each is multiplied back by
+    # its own denominator (mol_stable by molecules, atom_stable by atoms), and Unique/Novelty are
+    # set operations over the whole cell, so eval_rdmol has to run once in the parent rather than
+    # per chunk. Both halves are checked here.
+    from tools.eval_cond import stability_metrics
+    # A DELIBERATELY MIXED cell. With every molecule stable the fractions are all 1.0 and the
+    # recombination arithmetic is untested -- 1.0 recombines correctly under any wrong formula.
+    # So plant an unstable one: a carbon with a single bond, which no valence table allows. The
+    # molecule counts and atom counts then differ between chunks (5 atoms vs 2), which is exactly
+    # what a per-chunk average of averages would get wrong.
+    bad_oh = torch.zeros(1, N, A); bad_pos = torch.zeros(1, N, 3)
+    bad_fc = torch.zeros(1, N, 1); bad_ed = torch.zeros(1, N, N, dtype=torch.long)
+    bad_oh[0, 0, 1] = 1.0                        # C
+    bad_oh[0, 1, 0] = 1.0                        # H  -- CH, one bond short of anything valid
+    bad_pos[0, 1] = torch.tensor([1.09, 0.0, 0.0])
+    bad_ed[0, 0, 1] = bad_ed[0, 1, 0] = 1
+    unstable = mol_process(bad_oh, bad_pos, bad_fc, [2], bad_ed)
+    mixed = (processed + unstable) * 27          # 81 molecules, 2/3 stable, ragged chunk sizes
+    big = mixed
+    for kind in ('3d', '2d'):
+        ser_stab, ser_rdkit, _ = stability_metrics(big, info, kind, None, workers=1)
+        par_stab, par_rdkit, par_mols = stability_metrics(big, info, kind, None, workers=4)
+        same = (all(abs(ser_stab[k] - par_stab[k]) < 1e-12 for k in ser_stab)
+                and all(abs(ser_rdkit[k] - par_rdkit[k]) < 1e-12 for k in ser_rdkit))
+        # A mixed cell must not score 1.0; if it does, the planted molecule is not unstable
+        # and the comparison above proves nothing.
+        check(f'parallel {kind} stability == serial (mixed cell)',
+              same and len(par_mols) == len(big) and ser_stab['mol_stable'] < 1.0,
+              f"ser {ser_stab['mol_stable']:.6f}/{ser_stab['atom_stable']:.6f} "
+              f"par {par_stab['mol_stable']:.6f}/{par_stab['atom_stable']:.6f}")
+
+    # --- ADDED (scale): DataParallel batch padding arithmetic.
+    # DMT.forward reshapes a FLATTENED edge_mask by the xh batch size (models/dmt.py:436), so an
+    # uneven DataParallel split makes the two describe different molecules. sample_cond pads each
+    # chunk up to a multiple of the device count and drops the extras; if the drop were ever off,
+    # every later target's candidates would shift by one, silently.
+    for n_real, n_gpu, want in [(100, 4, 0), (101, 4, 3), (5, 4, 3), (23, 1, 0), (8, 4, 0)]:
+        pad = (-n_real) % n_gpu if n_gpu > 1 else 0
+        check(f'pad {n_real} molecules across {n_gpu} GPU(s) -> +{want}',
+              pad == want and (n_real + pad) % n_gpu == 0, f'got +{pad}')
+
+    # --- ADDED (scale): the portable export. It runs at the very END of a run that may have
+    # taken hours, which is the worst place to discover a typo -- so it is a module-level
+    # function and is exercised here on a hand-built cell instead.
+    import tempfile as _tf
+    from tools.sample_cond import write_portable
+    _, _, mols_for_sdf = get_2D_edm_metric(info)(processed)
+    fake_results = [{'mol': mi, 'ds_index': 1000 + mi, 'truth_smiles': 'C',
+                     'samples': [{'sample': 0, 'smiles': 'C', 'valid': True,
+                                  'tanimoto': 0.5, 'exact': False}]}
+                    for mi in range(len(processed))]
+    with _tf.TemporaryDirectory() as td:
+        n_sdf, n_rows = write_portable(td, 'test', '', fake_results, mols_for_sdf, 1)
+        check('write_portable emits one csv row per sample', n_rows == len(fake_results))
+        # sanitize=False: an invalid generated molecule is writeable but not strictly
+        # re-readable, and dropping it would be worse than keeping it.
+        from rdkit import Chem as _C
+        recs = [m for m in _C.SDMolSupplier(osp.join(td, 'generated_test.sdf'),
+                                            removeHs=False, sanitize=False)]
+        sdf_keys = [(m.GetProp('ds_index'), m.GetProp('sample')) for m in recs if m is not None]
+        csv_keys = [(r['ds_index'], r['sample'])
+                    for r in __import__('csv').DictReader(
+                        open(osp.join(td, 'generated_test.csv')))]
+        check('SDF and CSV are written in the same order',
+              len(recs) == n_sdf and sdf_keys == csv_keys[:len(sdf_keys)],
+              f'{n_sdf} sdf records, {n_rows} csv rows')
+
+    # The cube attribute probe both tools rely on.
+    from tools.sample_cond import cube_of, MODALITY_DEFAULTS
+    check('--modality knows both corpora', sorted(MODALITY_DEFAULTS) == ['stm', 'ters'])
+    # A real PyG Data with a graph but no cube -- what a sidecar-only dataset actually serves
+    # when load_cubes=False. The message must name what it looked for AND what was there.
+    from torch_geometric.data import Data
+    for label, sample in [('graph without a cube', Data(pos=torch.zeros(3, 3))),
+                          # ...and an object with no PyG API at all, because cube_of's own
+                          # `data.keys` diagnostic used to raise over the top of its message.
+                          ('object with no keys', torch.nn.Module())]:
+        try:
+            cube_of(sample)
+            check(f'cube_of raises on a {label}', False, 'it returned instead')
+        except AttributeError as exc:
+            check(f'cube_of raises on a {label}',
+                  'ters' in str(exc) and 'stm' in str(exc), str(exc)[:70])
+
+
+def tier_resume(tmp):
+    """The training resume path: save_checkpoint -> restore_checkpoint round-trip.
+
+    Guards a bug that reached a real run. utils.restore_checkpoint is the ONLY loader in the
+    repo that omitted weights_only=False, and torch 2.6 flipped that default to True. Our
+    checkpoints carry numpy scalars in the optimizer/EMA state, which the restricted unpickler
+    refuses -- so the first genuine resume would have died on `Weights only load failed`.
+    Nothing caught it because both prior runs started from step 0, where restore_checkpoint
+    returns before it ever loads anything.
+    """
+    print('\n=== Resume (checkpoint round-trip) ===')
+    from utils import restore_checkpoint, save_checkpoint
+
+    # save_checkpoint does not create its parent; run_lib.py:213 does that for the real run.
+    ckpt_dir = osp.join(tmp, 'checkpoints-meta', 'checkpoint.pth')
+    os.makedirs(osp.dirname(ckpt_dir), exist_ok=True)
+    model = torch.nn.Linear(4, 4)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    # A numpy scalar is what the restricted unpickler trips on, and it is not contrived: the
+    # real checkpoint's pickle carries `numpy._core.multiarray scalar`.
+    class _Ema:
+        def __init__(self):
+            self._s = {'decay': np.float32(0.999), 'num_updates': np.int64(7)}
+
+        def state_dict(self):
+            return self._s
+
+        def load_state_dict(self, s):
+            self._s = s
+
+    ema = _Ema()
+    # A real backward, because Adam only materialises its moment buffers once there are
+    # gradients -- and empty moments are exactly what a broken resume would silently produce.
+    model(torch.ones(2, 4)).sum().backward()
+    opt.step()
+    model.weight.data.fill_(0.25)
+    save_checkpoint(ckpt_dir, dict(optimizer=opt, model=model, ema=ema, step=75001))
+    check('save_checkpoint wrote a file', osp.exists(ckpt_dir))
+
+    fresh = torch.nn.Linear(4, 4)
+    fresh.weight.data.fill_(0.0)
+    state = dict(optimizer=torch.optim.Adam(fresh.parameters(), lr=1e-3),
+                 model=fresh, ema=_Ema(), step=0)
+    try:
+        state = restore_checkpoint(ckpt_dir, state, 'cpu')
+        loaded = True
+        detail = ''
+    except Exception as exc:
+        loaded = False
+        detail = f'{type(exc).__name__}: {str(exc)[:80]}'
+    check('restore_checkpoint loads a checkpoint holding numpy scalars', loaded, detail)
+    if not loaded:
+        return
+
+    check('step is restored, so training does not silently start over',
+          state['step'] == 75001, str(state['step']))
+    check('model weights are restored', bool(torch.allclose(fresh.weight.data,
+                                                            torch.full((4, 4), 0.25))))
+    check('optimizer state is restored, not reinitialised',
+          len(state['optimizer'].state_dict()['state']) > 0)
+    check('ema state is restored', state['ema'].state_dict()['num_updates'] == 7)
+
+    # A missing file must NOT raise -- run_lib relies on that to start a fresh run.
+    absent = dict(optimizer=opt, model=model, ema=ema, step=0)
+    same = restore_checkpoint(osp.join(tmp, 'nope', 'checkpoint.pth'), absent, 'cpu')
+    check('a missing checkpoint returns the state untouched', same['step'] == 0)
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix='stm-tests-')
     try:
@@ -353,6 +730,8 @@ def main():
         graph_dir = tier_preprocess(tmp, h5_dir, n)
         tier_dataset(h5_dir, graph_dir)
         tier_config(h5_dir, graph_dir)
+        tier_metrics()
+        tier_resume(tmp)
         tier_real()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

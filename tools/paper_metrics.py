@@ -19,10 +19,10 @@ Reported per cell:
 
 The null column is the point. A Tanimoto means nothing on its own here: the model is handed the
 true atom count and the chemical space is narrow, so the prior alone scores well above zero.
-`sample_ters --shuffle-cubes` pairs each target with another molecule's cube; the gap between
+`sample_cond --shuffle-cubes` pairs each target with another molecule's cube; the gap between
 matched and shuffled is the part attributable to the TERS measurement.
 """
-import argparse, os, pickle, sys, warnings
+import argparse, os, pickle, sys, time, warnings
 import pandas as pd
 from rdkit import Chem, RDLogger
 from rdkit.Chem import AllChem, DataStructs, MACCSkeys
@@ -78,15 +78,62 @@ def pair_metrics(true_mol, pred_mol, with_mces=True):
     return out
 
 
-def score_cell(path, ks, with_mces=True):
+# --- ADDED (stm): scoring is embarrassingly parallel, and it was the whole bottleneck ------
+# Measured on the 115615-pair test-set run: 68.4 ms per pair single-threaded = 2.2 h, against
+# 4.2 h for the GPU generation that produced the pairs. The breakdown is the surprise --
+#
+#     Fraggle 45.3 ms   MCES 18.1 ms   MACCS 1.4   InChIKey 0.8   FG 0.7   Morgan 0.1
+#
+# so Fraggle, not the MCES integer program, is 93% of the non-MCES cost. Neither is
+# parallelised internally, but targets are completely independent of each other, so the loop
+# over them is. A GPU node has 72 cores and the CPU partitions have 384.
+#
+# `_SHARED` is set in the parent before the pool forks, so workers inherit the (large) mol
+# lists copy-on-write instead of pickling them to every worker.
+_SHARED = None
+
+
+def _score_one_target_serial(d, mi, ns, with_mces):
+    return [pair_metrics(d['truth'][mi], d['generated'][mi * ns + si], with_mces)
+            for si in range(ns)]
+
+
+def _score_one_target(job):
+    """One target's candidates. Module-level (not a closure) so it is picklable by Pool."""
+    mi, ns, with_mces = job
+    d = _SHARED
+    return [pair_metrics(d['truth'][mi], d['generated'][mi * ns + si], with_mces)
+            for si in range(ns)]
+
+
+def score_cell(path, ks, with_mces=True, workers=1):
+    global _SHARED
     with open(path, 'rb') as f:
         d = pickle.load(f)
     nm, ns = d['n_mols'], d['n_samples']
-    per_mol = []
-    for mi in range(nm):
-        cands = [pair_metrics(d['truth'][mi], d['generated'][mi * ns + si], with_mces)
-                 for si in range(ns)]
-        per_mol.append(cands)
+    jobs = [(mi, ns, with_mces) for mi in range(nm)]
+
+    if workers > 1 and nm > 1:
+        import multiprocessing as mp
+        _SHARED = d                       # inherited by fork; never sent over a pipe
+        # fork (not spawn) so the mol lists are shared copy-on-write. chunksize keeps the
+        # per-task overhead well below the ~340 ms a 5-sample target costs.
+        ctx = mp.get_context('fork')
+        chunk = max(1, min(64, nm // (workers * 8) or 1))
+        t0 = time.time()
+        per_mol = []
+        with ctx.Pool(workers) as pool:
+            for i, cands in enumerate(pool.imap(_score_one_target, jobs, chunksize=chunk), 1):
+                per_mol.append(cands)
+                # progress, because the serial version printed nothing for 2.2 h and was
+                # indistinguishable from a hang
+                if i % 2000 == 0 or i == nm:
+                    el = time.time() - t0
+                    print(f'    {i}/{nm} targets  {el:.0f}s elapsed  '
+                          f'eta {el / i * (nm - i):.0f}s', file=sys.stderr, flush=True)
+    else:
+        per_mol = [_score_one_target_serial(d, mi, ns, with_mces) for mi in range(nm)]
+
     n = len(per_mol)
     row = {'n_targets': n, 'n_samples': ns}
     for k in ks:
@@ -110,14 +157,21 @@ def main():
                     help='NAME=/path/to/mols_<split>[_shuf].pkl, repeatable')
     ap.add_argument('--ks', nargs='+', type=int, default=[1, 3, 5, 10])
     ap.add_argument('--no-mces', action='store_true', help='skip the ILP metric (much faster)')
+    ap.add_argument('--workers', type=int, default=0,
+                    help='parallel processes over TARGETS (0 = auto = os.cpu_count(), '
+                         '1 = serial). Results are identical either way -- the per-pair '
+                         'metrics are deterministic and Pool.imap preserves order.')
     ap.add_argument('--out', default='')
     args = ap.parse_args()
+
+    workers = args.workers or (os.cpu_count() or 1)
+    print(f'scoring with {workers} worker process(es)', file=sys.stderr)
 
     rows = {}
     for spec in args.cells:
         name, path = spec.split('=', 1)
         print(f'scoring {name} ...', file=sys.stderr)
-        rows[name] = score_cell(path, args.ks, with_mces=not args.no_mces)
+        rows[name] = score_cell(path, args.ks, with_mces=not args.no_mces, workers=workers)
     df = pd.DataFrame(rows)
     pd.set_option('display.width', 200, 'display.max_rows', 100)
     print('\n' + '=' * 96)

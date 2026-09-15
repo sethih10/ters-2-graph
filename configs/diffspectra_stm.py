@@ -154,6 +154,29 @@ def get_config():
     model.stm_in_channels = 14           # STM-MEASURED: = len(attrs['z_slices']), z = 6..19.
                                          # StmGraphDataset cross-checks this against the file
                                          # and raises if they disagree.
+    # STM: which conditioning encoder to build. 'v1' is the ASDAFMNet-derived stem this run
+    # was trained with (models/stm_encoder.py); 'v2' is the deep residual 3D encoder
+    # (models/stm_encoder_v2.py), ~3.5M params against v1's 1.30M.
+    # The two have different parameter SHAPES -- a v1 checkpoint cannot resume as v2.
+    # Override without editing: --config.model.stm_encoder=v2
+    #
+    # 'clip' is the contrastively PRETRAINED encoder (models/stm_encoder_clip.py) -- the
+    # same 1.31M shape as v1's ladder, but with weights fitted by InfoNCE against a 3D
+    # structure embedding in the sibling ters-clip folder, which is the pre-training stage
+    # docs/09-research-summary.md 5b ranks third in its own next-steps list. It is the only
+    # value of this key that can load pretrained_stm_encoder_path.
+    #
+    # Each version reads its OWN knobs (stm_* / stm_v2_* / stm_clip_*), never another's --
+    # otherwise flipping this one key would build a "deep" encoder with v1's 4/8/16 widths
+    # and still call it v2. Only stm_in_channels is shared; it describes the corpus, not the
+    # model.
+    # --- SET 2026-09-14 for the pretrained-conditioning run. Was 'v1'.
+    # This is a RUN SETTING, not a corpus fact. Two consequences before you change anything
+    # else: (1) the architecture differs from v1, so the existing 150k v1 checkpoints
+    # (checkpoint_6, job 1134521/1256193) CANNOT be resumed or evaluated under this config --
+    # set this back to 'v1' to touch them; (2) eval/generation read the same config, so they
+    # must run against a checkpoint trained with the same value.
+    model.stm_encoder = 'clip'
     model.stm_conv3d_channels = [4, 8, 16]   # STM: the ASDAFMNet 3D stem ladder.
     model.stm_filters = [64, 128, 256]   # STM: three 2D blocks, not TERS's four. The 3D stem
                                          # already downsamples 8x spatially (128 -> 16), so a
@@ -165,6 +188,52 @@ def get_config():
     # spatial layout entirely; E-1 (docs/experimental.md) found that harmful on TERS.
     # Override without editing: --config.model.stm_pool_size=1
     model.stm_pool_size = 2
+
+    # --- STM v2 encoder knobs (models/stm_encoder_v2.py). Inert while stm_encoder == 'v1'.
+    # Defaults are the EDAFMNet ladder; see that file's provenance block for why these
+    # numbers and not others.
+    model.stm_v2_conv3d_channels = [48, 96, 192]   # EDAFMNet widths; v1's ladder is 4/8/16
+    model.stm_v2_block_depth = 2                   # convolutions per residual 3D block
+    model.stm_v2_filters = [128, 256]              # 2D trunk after the z-collapse
+    model.stm_v2_pool_size = 2
+    # The stem strides SPATIALLY before the widths grow. This is a memory decision, not a
+    # modelling one: a 48-channel activation at the full 128x128 is ~1.4 GB per stored
+    # tensor at batch 128. Set stm_v2_stem_stride=1 only with a measured memory budget.
+    model.stm_v2_stem_channels = 16
+    model.stm_v2_stem_stride = 2
+
+    # --- STM clip encoder knobs (models/stm_encoder_clip.py). Inert unless
+    # stm_encoder == 'clip'. These are not free parameters: they are the shape of the
+    # released checkpoint, RECOVERED FROM ITS WEIGHTS (read_ckpt_geometry in that module),
+    # because the checkpoint's own args dict predates ters-clip's --cube-pool-size /
+    # --stem-channels / --filters flags and records none of them. Change one and the load
+    # raises rather than half-succeeding.
+    model.stm_clip_conv3d_channels = [4, 8, 16]    # = stem3d.N.conv2.weight shapes
+    model.stm_clip_z_strides = [2, 2, 1]           # 14 -> 7 -> 3 -> 3; to_2d is over 16*3=48
+    model.stm_clip_filters = [64, 128, 256]        # = blocks.N.conv2.weight shapes
+    # 1, NOT the 2 that stm_pool_size above is set to. head.2.weight is
+    # Linear(filters[-1] * pool_size**2, nf) and the released tensor is (256, 256) with
+    # filters[-1] = 256, so pool_size can only be 1. This is the one place where the clip
+    # arm and the v1 arm genuinely differ in shape, and it is why the knob is not shared.
+    # It also means the clip arm is not a like-for-like swap for v1's measured pool_size=2;
+    # ters-clip job 1264316 measured pool 1 vs 2 as noise (2.98x vs 2.82x), so the
+    # confound is small, but it is a confound and docs/09 should say so.
+    model.stm_clip_pool_size = 1
+
+    # STM: path to a ters-clip cube_encoder_*.pt. Empty = train the clip-shaped encoder from
+    # scratch, which is the random-init CONTROL arm rather than the pretrained one -- the
+    # difference that licenses reading the result, so say which arm you are running.
+    # Setting this with stm_encoder != 'clip' RAISES (models/dmt.py); it does not warn.
+    # The artefact: ters-clip job 1264302, epoch 21 of 50, cone 0.168 on held-out cubes
+    # against v1's trained 0.967. models/stm_encoder_clip.py:DEFAULT_CKPT has the path.
+    # Override without editing: --config.model.pretrained_stm_encoder_path=/path/to.pt
+    # --- SET 2026-09-14: ters-clip job 1264302, epoch 21 of 50. Was '' (from scratch).
+    # Loads 64/64 tensors; the log line to look for is
+    #   'Loaded 64/64 tensors into StmCubeEncoder ... (epoch 21, pool_size=1, 1.31M params)'
+    # Anything else -- and especially 'Train StmCubeEncoder from scratch' -- means this
+    # is the random-init control arm, not the pretrained one.
+    model.pretrained_stm_encoder_path = (
+        '/scratch/project_2001912/sethih1/runs/clip-full-1264302/cube_encoder_best.pt')
 
     # # loss function
     model.loss_weights = '1., 0.25, 0.1'
@@ -198,8 +267,10 @@ def get_config():
     # against TersEncoder's larger trunk. The larger max_node (54 vs 40) did not offset it.
     base_batch_size = 128
     training.batch_size = base_batch_size * training.num_gpus
-    # Consumed only by get_sampling_fn, which snapshot_sampling=False disables. Left tied to
-    # base_batch_size so they stay correct if sampling is re-enabled.
+    # Consumed only by get_sampling_fn, which snapshot_sampling=False disables -- so these two
+    # are DEAD on every path this project actually runs. tools/sample_cond.py takes its batch
+    # size from --batch-mols instead. Left tied to base_batch_size so they stay correct if
+    # D-8 is ever fixed and snapshot sampling re-enabled.
     training.eval_batch_size = base_batch_size * training.num_gpus
     training.eval_samples = base_batch_size * training.num_gpus
     training.accum_steps = 8              # STILL DEAD -- nothing outside this file reads it.
@@ -240,12 +311,22 @@ def get_config():
     # 587 MB file no matter how often it fires; frequent is good, it is the resume point.
     training.snapshot_freq_for_preemption = 2000 // training.num_gpus
     # STM: True -> False, and for the same reason as TERS -- sampling.py has no cube branch.
-    # sampling.py:158 reads `config.data.spectra_version` by direct attribute access (not
-    # getattr), which this config deliberately does not define, and `context` at
-    # sampling.py:206-219 is only assigned inside the uv/ir/raman/allspectra branches, so
-    # even after adding the key `context` would be unbound. With this True the run dies at
-    # the FIRST SNAPSHOT (~1 h in), not at startup -- the kind of failure that wastes an
-    # allocation. Use tools/sample_ters.py after training instead.
+    # MUST STAY FALSE. Defect D-8 is still OPEN; it was routed around, not fixed. Four
+    # separate things break on this path, and each surfaces only after the one before it:
+    #   1. sampling.py:159 and :364 read `config.data.spectra_version` by DIRECT attribute
+    #      access (not getattr), and this config deliberately does not define it;
+    #   2. `context` (sampling.py:206-219, :414-427) is only ever assigned inside the
+    #      uv/ir/raman/allspectra branches, so even after adding the key it is unbound;
+    #   3. sampling.py:204 calls `mol.num_atom.item()`, but the STM/TERS sidecars store
+    #      num_atom as a plain int (datasets/preprocess_ters.py:233), not a tensor;
+    #   4. sampling.py:227 iterates `range(batch_size)` over a possibly shorter `n_nodes`.
+    # With this True the run dies at the FIRST SNAPSHOT (~1 h in), not at startup -- the kind
+    # of failure that wastes an allocation.
+    #
+    # Evaluate after training instead. That path is complete and does not touch sampling.py:
+    #   python -m tools.sample_cond --modality stm --ckpt <ckpt> --split test ...
+    #   python -m tools.eval_cond   --samples <out>/processed_test.pkl
+    #   python3 metric_evaluation/run_metrics.py        # both, all four cells
     training.snapshot_sampling = False
 
     # --- ADDED (wandb) ------------------------------------------------------------------

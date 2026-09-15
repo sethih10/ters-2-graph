@@ -11,6 +11,9 @@ from .specformer import SpecFormer
 from .ters_encoder import TersEncoder
 # --- ADDED (stm): STM z-stack conditioning encoder ------------------------------------
 from .stm_encoder import StmEncoder
+from .stm_encoder_v2 import StmEncoderV2
+# --- ADDED (stm-clip): contrastively pretrained STM encoder + its strict loader --------
+from .stm_encoder_clip import StmCubeEncoder, load_pretrained_stm_cube_encoder
 
 
 def modulate(x, shift, scale):
@@ -285,15 +288,69 @@ class DMT(nn.Module):
             # --- ADDED (stm): every knob getattr-defaulted, so an STM config only has to set
             # data.name and (if the corpus differs) stm_in_channels. Nothing downstream of
             # cond_lin moves -- output_dim is hidden_dim exactly as in the other two branches.
-            self.cond_encoder = StmEncoder(
-                # = len(f[split].attrs['z_slices']); 14 for /scratch/project_2001912/stm-data.
-                in_channels=getattr(config.model, 'stm_in_channels', 14),
-                conv3d_channels=tuple(getattr(config.model, 'stm_conv3d_channels',
-                                              (4, 8, 16))),
-                filters=tuple(getattr(config.model, 'stm_filters', (64, 128, 256))),
-                output_dim=hidden_dim,
-                pool_size=getattr(config.model, 'stm_pool_size', 1),
-            )
+            #
+            # --- ADDED (stm-v2): 'v2' selects the deep residual 3D encoder
+            # (models/stm_encoder_v2.py). Default stays 'v1', so every existing STM config
+            # and every existing checkpoint keeps the architecture it was trained with --
+            # this switch changes the parameter shapes, so a v1 checkpoint cannot be loaded
+            # into v2 and must not be silently attempted.
+            #
+            # --- ADDED (stm-clip): 'clip' selects the contrastively PRETRAINED encoder
+            # (models/stm_encoder_clip.py), a port of ters-clip's StmCubeEncoder whose
+            # released weights load into it strictly. Default stays 'v1'.
+            # NOT named 'v3': tests/test_stm.py:306 uses that string as the
+            # unknown-value sentinel, so taking it would silently disarm that check.
+            stm_version = str(getattr(config.model, 'stm_encoder', 'v1')).lower()
+            if stm_version not in ('v1', 'v2', 'clip'):
+                raise ValueError(
+                    f"config.model.stm_encoder must be 'v1', 'v2' or 'clip', got "
+                    f'{stm_version!r}')
+            # Kept on self because the checkpoint branch below is a separate if/elif chain
+            # and reading a local assigned in another branch is the kind of implicit
+            # coupling that breaks the first time someone reorders __init__.
+            self.stm_version = stm_version
+            if stm_version == 'clip':
+                # clip reads stm_clip_* knobs, NOT stm_* or stm_v2_*. pool_size in
+                # particular MUST be 1 for the released checkpoint while v1's measured
+                # setting is 2 -- sharing the name would build an unloadable head and
+                # report it as clip. Only stm_in_channels is shared (corpus, not model).
+                self.cond_encoder = StmCubeEncoder(
+                    in_channels=getattr(config.model, 'stm_in_channels', 14),
+                    conv3d_channels=tuple(getattr(config.model, 'stm_clip_conv3d_channels',
+                                                  (4, 8, 16))),
+                    z_strides=tuple(getattr(config.model, 'stm_clip_z_strides', (2, 2, 1))),
+                    filters=tuple(getattr(config.model, 'stm_clip_filters',
+                                          (64, 128, 256))),
+                    output_dim=hidden_dim,
+                    pool_size=getattr(config.model, 'stm_clip_pool_size', 1),
+                )
+            elif stm_version == 'v2':
+                # v2 reads stm_v2_* knobs, NOT the stm_* ones. Sharing them would be a
+                # silent trap: an existing STM config already sets stm_conv3d_channels to
+                # v1's (4, 8, 16) ladder, so a shared name would build a "deep" encoder with
+                # v1's widths and report it as v2. Only stm_in_channels is shared, because
+                # that is a property of the corpus rather than of the architecture.
+                self.cond_encoder = StmEncoderV2(
+                    in_channels=getattr(config.model, 'stm_in_channels', 14),
+                    stem_channels=getattr(config.model, 'stm_v2_stem_channels', 16),
+                    stem_stride=getattr(config.model, 'stm_v2_stem_stride', 2),
+                    conv3d_channels=tuple(getattr(config.model, 'stm_v2_conv3d_channels',
+                                                  (48, 96, 192))),
+                    block_depth=getattr(config.model, 'stm_v2_block_depth', 2),
+                    filters=tuple(getattr(config.model, 'stm_v2_filters', (128, 256))),
+                    output_dim=hidden_dim,
+                    pool_size=getattr(config.model, 'stm_v2_pool_size', 2),
+                )
+            else:
+                self.cond_encoder = StmEncoder(
+                    # = len(f[split].attrs['z_slices']); 14 for /scratch/project_2001912/stm-data.
+                    in_channels=getattr(config.model, 'stm_in_channels', 14),
+                    conv3d_channels=tuple(getattr(config.model, 'stm_conv3d_channels',
+                                                  (4, 8, 16))),
+                    filters=tuple(getattr(config.model, 'stm_filters', (64, 128, 256))),
+                    output_dim=hidden_dim,
+                    pool_size=getattr(config.model, 'stm_pool_size', 1),
+                )
         else:
             self.cond_encoder = SpecFormer(patch_len=config.model.patch_len, stride=config.model.stride, output_dim=hidden_dim, spectra_version=config.data.spectra_version)
 
@@ -325,7 +382,27 @@ class DMT(nn.Module):
                     'config.model.pretrained_specformer_path is set but the STM encoder is '
                     'a 3D conv trunk, not a SpecFormer -- no key would match. Clear it to '
                     'train from scratch.')
-            print("Train StmEncoder from scratch")
+            # --- ADDED (stm-clip): load the contrastively pretrained weights ------------
+            stm_ckpt = getattr(config.model, 'pretrained_stm_encoder_path', '')
+            if stm_ckpt and self.stm_version != 'clip':
+                # REFUSAL, recorded in docs/07-change-manifest.md 5. This checkpoint's 2D
+                # half is key- AND shape-identical to v1's, so load_pretrained_ters_encoder
+                # would match 31 of v1's 40 tensors -- a random 3D stem and a random head --
+                # and print "Loaded 31/40" without raising. A partial load of a pretrained
+                # encoder is not a warning, it is a different experiment.
+                raise ValueError(
+                    f'config.model.pretrained_stm_encoder_path is set but '
+                    f'config.model.stm_encoder is {self.stm_version!r}. Those weights are '
+                    f"a StmCubeEncoder's; {self.stm_version} has a different 3D stem and "
+                    f'would load only its 2D trunk while logging success. Set '
+                    f"config.model.stm_encoder='clip', or clear the checkpoint path.")
+            if stm_ckpt:
+                print('Load pretrained StmCubeEncoder (contrastive, ters-clip job 1264302)')
+                load_pretrained_stm_cube_encoder(self.cond_encoder, stm_ckpt)
+            else:
+                print(f"Train {type(self.cond_encoder).__name__} from scratch "
+                      f"({sum(p.numel() for p in self.cond_encoder.parameters())/1e6:.2f}M "
+                      f"params)")
         elif specformer_ckpt:
             print("Load pretrained SpecFormer")
             self.load_pretrained_specformer(specformer_ckpt)

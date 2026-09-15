@@ -10,7 +10,8 @@ number means and — more usefully — what each number *cannot* tell you.
 | --- | --- | --- |
 | per-pair chemistry | [`compute_metrics.py`](../compute_metrics.py) | the seven metrics below, at the paper's parameters |
 | top-k + null aggregation | [`tools/paper_metrics.py`](../tools/paper_metrics.py) | what upstream cannot express (see §3) |
-| generation | [`tools/sample_ters.py`](../tools/sample_ters.py) | candidates, matched or shuffled cubes |
+| generation | [`tools/sample_cond.py`](../tools/sample_cond.py) | candidates, matched or shuffled cubes |
+| distributional | [`tools/eval_cond.py`](../tools/eval_cond.py) | FCD, SNN, Frag, Scaf, IntDiv, stability, novelty. **Metric-2D only** — Metric-3D scores 0.250 on ground-truth structures (2D: 0.974), so it is not quotable on this corpus |
 | orchestration | [`run_metrics.py`](run_metrics.py) | this folder — invokes the above, computes nothing |
 
 ---
@@ -71,12 +72,12 @@ reporting a top-10 computed from five candidates.
 
 ### The null cells are the load-bearing half
 
-`sample_ters.py --shuffle-cubes` pairs every target with **another molecule's** cube (a
+`sample_cond.py --shuffle-cubes` pairs every target with **another molecule's** cube (a
 derangement, so no target keeps its own). Target, atom count, noise draw and scoring are unchanged
 — the conditioning is the only thing that differs.
 
 This matters because **the sampler is handed the true atom count**
-([`tools/sample_ters.py:98`](../tools/sample_ters.py#L98)) and the chemical space is narrow, so the
+([`tools/sample_cond.py:98`](../tools/sample_cond.py#L98)) and the chemical space is narrow, so the
 prior alone scores well above zero on every similarity metric. On TERS the shuffled null reached
 Tanimoto MACCS 0.361 and Functional Group 0.512 while recovering *zero* targets. **A raw Tanimoto
 is close to meaningless here; the matched-minus-shuffled gap is the measurement's contribution.**

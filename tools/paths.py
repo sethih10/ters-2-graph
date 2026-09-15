@@ -13,7 +13,7 @@ So every output path resolves through here, and the default root is project scra
 Override with ``TERS_EXP_ROOT`` (mirrors the ``TERS_WORKDIR`` convention the sbatch scripts
 already use), e.g. to write somewhere else for a one-off:
 
-    TERS_EXP_ROOT=/scratch/project_2001912/scratch-me python3 tools/sample_ters.py ...
+    TERS_EXP_ROOT=/scratch/project_2001912/scratch-me python3 tools/sample_cond.py ...
 """
 
 import os

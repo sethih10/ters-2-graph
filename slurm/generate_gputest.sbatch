@@ -24,7 +24,7 @@ cd "$SLURM_SUBMIT_DIR"
 # arm, e.g.  sbatch --export=ALL,TERS_CKPT=/scratch/.../checkpoint_5.pth  docs/experimental.md
 CKPT="${TERS_CKPT:-exp/ters_20260828_925597/checkpoints/checkpoint_5.pth}"
 echo "ckpt : $CKPT"
-# Derive the output dir from the checkpoint. tools/sample_ters.py defaults --out to the
+# Derive the output dir from the checkpoint. tools/sample_cond.py defaults --out to the
 # Aug-28 control's generated/ dir, so running another arm without this SILENTLY OVERWRITES
 # the baseline samples the comparison depends on.
 OUT="${TERS_OUT:-$(dirname "$(dirname "$CKPT")")/generated}"
@@ -41,7 +41,7 @@ TAG="${TERS_SHUF:+_shuf}"
 echo "n_mols=$NMOLS n_samples=$NSAMP shuffled=${TERS_SHUF:-0}"
 
 for SP in test val; do
-  python -m tools.sample_ters --ckpt "$CKPT" --split $SP \
+  python -m tools.sample_cond --ckpt "$CKPT" --split $SP \
       --n-mols "$NMOLS" --n-samples "$NSAMP" --out "$OUT" $SHUF
 done
 python -m tools.render_samples --dir "$OUT" --tag "$TAG"

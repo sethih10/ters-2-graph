@@ -12,7 +12,14 @@ def restore_checkpoint(ckpt_dir, state, device):
                         f"Returned the same state as input")
         return state
     else:
-        loaded_state = torch.load(ckpt_dir, map_location=device)
+        # weights_only=False is REQUIRED, not defensive: torch 2.6 flipped the default to True,
+        # and our checkpoints carry numpy scalars (optimizer/EMA state) that the restricted
+        # unpickler refuses -- `Weights only load failed ... numpy._core.multiarray scalar`.
+        # Every loader in tools/ already passes it (e.g. tools/diagnose_progress.py:76); this
+        # one did not, and it is the one the training resume goes through. It had never been
+        # exercised because both prior runs started from step 0, where the branch above returns
+        # early -- so the first real resume would have died here. These files are our own output.
+        loaded_state = torch.load(ckpt_dir, map_location=device, weights_only=False)
         state['optimizer'].load_state_dict(loaded_state['optimizer'])
         state['model'].load_state_dict(loaded_state['model'], strict=True)  # change strict to False?
         state['ema'].load_state_dict(loaded_state['ema'])

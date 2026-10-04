@@ -1,23 +1,6 @@
-"""Auxiliary STM config -- the one passed as `--config_original_qm9`.
+"""Auxiliary STM config for `--config_original_qm9`.
 
-ADAPT of configs/base_ters.py, which explains the whole point of this file:
-
-    run_lib.py:181 and :306 call `get_dataset` on it and keep the splits as `*_ds_original`.
-    Those objects are used in exactly one place --
-
-        run_lib.py:339   train_mols = [second_train_ds_original[i].rdmol for i in ...]
-        run_lib.py:341   test_mols  = [test_ds_original[i].rdmol  for i in ...]
-
-    i.e. the MOSES reference sets. Nothing else reads them.
-
-So this config sets **`data.load_cubes = False`**. That matters more here than it did for
-TERS: the STM train split is 184180 molecules, and reading one 917 KB z-stack per molecule to
-build `train_mols` would be ~169 GB of I/O for data that is discarded on the next line. In
-that mode `StmGraphDataset` never opens the cube array at all and serves the sidecar alone.
-
-The model / optim / sampling sections below are inherited and are **not read** on this path --
-`create_model`, the optimiser and the sampler are all built from the *main* config. They are
-kept so the file remains a valid, self-contained config rather than a fragment.
+Only its graph splits are read, as reference molecules for the metrics; cubes are never loaded.
 """
 
 import ml_collections
@@ -27,16 +10,14 @@ import torch
 def get_config():
     config = ml_collections.ConfigDict()
 
-    # `get_dataset` branches to _build_stm on data.name before it ever reads exp_type, so the
-    # 5-tuple comes back regardless of what this says.
     config.exp_type = 'diffspectra'
     config.pred_edge = True
     config.only_2D = False
 
     # data
     config.data = data = ml_collections.ConfigDict()
-    data.root = '/scratch/project_2001912/stm-data'
-    data.graph_root = '/scratch/project_2001912/stm-graphs'
+    data.root = '/scratch/project_2001912/sethih1/stm-data'
+    data.graph_root = '/scratch/project_2001912/sethih1/stm-graphs'
     data.name = 'STM'
     data.processed_file = ''
     data.transform = 'EdgeComSpectra'
@@ -45,19 +26,17 @@ def get_config():
     data.num_workers = 2
 
     data.stm_key = 'X'
-    data.load_cubes = False              # >>> the point of this file. See the module docstring.
+    data.load_cubes = False              # graph sidecar only
     data.use_normalize = True
     data.aug_translation_scale = 0.1
 
     data.compress_edge = True
     data.centered = True
-    data.include_aromatic = False        # must match the main config, or the edge feature width
-                                         # of the reference mols disagrees with the model's
-    data.atom_types = 10                 # must match diffspectra_stm.py -- the atom one-hot
-                                         # width of the reference mols is built from this
+    data.include_aromatic = False        # must match the main config
+    data.atom_types = 10                 # must match the main config
     data.bond_types = 4
     data.fc_scale = [-1., 1.]
-    data.max_node = 54                   # dead config; documentation only
+    data.max_node = 54                   # max atoms per molecule; not read
 
     # SDE
     config.sde = sde = ml_collections.ConfigDict()
@@ -65,9 +44,7 @@ def get_config():
     sde.continuous_beta_0 = 0.1
     sde.continuous_beta_1 = 20.
 
-    # ---------------------------------------------------------------------------------------
-    # Everything below is inherited and is NOT read on this path.
-    # ---------------------------------------------------------------------------------------
+    # Not read on this path; kept so the config is complete.
 
     config.model = model = ml_collections.ConfigDict()
     model.name = 'DMT'
@@ -131,7 +108,7 @@ def get_config():
     config.eval = evaluate = ml_collections.ConfigDict()
     evaluate.enable_sampling = True
     evaluate.batch_size = 16
-    evaluate.num_samples = 23123          # STM: the test split size
+    evaluate.num_samples = 23123          # test split size
     evaluate.begin_ckpt = 12
     evaluate.end_ckpt = 12
     evaluate.ckpts = ''

@@ -9,10 +9,8 @@ from torch_scatter import scatter
 import functools
 from .specformer import SpecFormer
 from .ters_encoder import TersEncoder
-# --- ADDED (stm): STM z-stack conditioning encoder ------------------------------------
 from .stm_encoder import StmEncoder
 from .stm_encoder_v2 import StmEncoderV2
-# --- ADDED (stm-clip): contrastively pretrained STM encoder + its strict loader --------
 from .stm_encoder_clip import StmCubeEncoder, load_pretrained_stm_cube_encoder
 
 
@@ -262,58 +260,28 @@ class DMT(nn.Module):
                 nn.Linear(time_dim, time_dim)
             )
 
-        # Implement conditioning encoder.  Both branches honour the same contract -- a
-        # (B, output_dim) vector for cond_lin -- so nothing downstream of line 349 changes.
+        # Conditioning encoder; every branch must output (B, hidden_dim) for cond_lin.
         self.spectra_version = getattr(config.data, 'spectra_version', None)
-        # --- ADDED (stm): route data.name == 'STM' to its own encoder ---------------------
-        # A third kind rather than folding STM into 'ters'. Rejected reusing the TERS branch
-        # with ters_in_channels=14: it runs -- the tensor contract is identical -- but TERS
-        # channels are unordered spectral bins while STM channels are ordered constant-height
-        # z-slices, so the 1x1 spectral stem has no inductive bias for the axis that carries
-        # the height information. See models/stm_encoder.py for the measurement.
         _cond_kinds = {'TERS': 'ters', 'STM': 'stm'}
         self.cond_encoder_kind = _cond_kinds.get(config.data.name, 'specformer')
 
         if self.cond_encoder_kind == 'ters':
-            # TERS conditions on an image cube, not 1-D spectra.  See docs/02-reuse-map.md 4.
             self.cond_encoder = TersEncoder(
                 in_channels=config.model.ters_in_channels,
                 filters=tuple(getattr(config.model, 'ters_filters', (64, 128, 256, 512))),
                 output_dim=hidden_dim,
-                # Default 1 = the original global average pool, so an existing config that
-                # does not set this key trains exactly the run it used to.  docs/experimental.md
                 pool_size=getattr(config.model, 'ters_pool_size', 1),
             )
         elif self.cond_encoder_kind == 'stm':
-            # --- ADDED (stm): every knob getattr-defaulted, so an STM config only has to set
-            # data.name and (if the corpus differs) stm_in_channels. Nothing downstream of
-            # cond_lin moves -- output_dim is hidden_dim exactly as in the other two branches.
-            #
-            # --- ADDED (stm-v2): 'v2' selects the deep residual 3D encoder
-            # (models/stm_encoder_v2.py). Default stays 'v1', so every existing STM config
-            # and every existing checkpoint keeps the architecture it was trained with --
-            # this switch changes the parameter shapes, so a v1 checkpoint cannot be loaded
-            # into v2 and must not be silently attempted.
-            #
-            # --- ADDED (stm-clip): 'clip' selects the contrastively PRETRAINED encoder
-            # (models/stm_encoder_clip.py), a port of ters-clip's StmCubeEncoder whose
-            # released weights load into it strictly. Default stays 'v1'.
-            # NOT named 'v3': tests/test_stm.py:306 uses that string as the
-            # unknown-value sentinel, so taking it would silently disarm that check.
             stm_version = str(getattr(config.model, 'stm_encoder', 'v1')).lower()
             if stm_version not in ('v1', 'v2', 'clip'):
                 raise ValueError(
                     f"config.model.stm_encoder must be 'v1', 'v2' or 'clip', got "
                     f'{stm_version!r}')
-            # Kept on self because the checkpoint branch below is a separate if/elif chain
-            # and reading a local assigned in another branch is the kind of implicit
-            # coupling that breaks the first time someone reorders __init__.
             self.stm_version = stm_version
+            # Each version has its own config keys (stm_clip_*, stm_v2_*, stm_*); only
+            # stm_in_channels is shared, since values set for v1 do not fit the others.
             if stm_version == 'clip':
-                # clip reads stm_clip_* knobs, NOT stm_* or stm_v2_*. pool_size in
-                # particular MUST be 1 for the released checkpoint while v1's measured
-                # setting is 2 -- sharing the name would build an unloadable head and
-                # report it as clip. Only stm_in_channels is shared (corpus, not model).
                 self.cond_encoder = StmCubeEncoder(
                     in_channels=getattr(config.model, 'stm_in_channels', 14),
                     conv3d_channels=tuple(getattr(config.model, 'stm_clip_conv3d_channels',
@@ -325,11 +293,6 @@ class DMT(nn.Module):
                     pool_size=getattr(config.model, 'stm_clip_pool_size', 1),
                 )
             elif stm_version == 'v2':
-                # v2 reads stm_v2_* knobs, NOT the stm_* ones. Sharing them would be a
-                # silent trap: an existing STM config already sets stm_conv3d_channels to
-                # v1's (4, 8, 16) ladder, so a shared name would build a "deep" encoder with
-                # v1's widths and report it as v2. Only stm_in_channels is shared, because
-                # that is a property of the corpus rather than of the architecture.
                 self.cond_encoder = StmEncoderV2(
                     in_channels=getattr(config.model, 'stm_in_channels', 14),
                     stem_channels=getattr(config.model, 'stm_v2_stem_channels', 16),
@@ -343,7 +306,6 @@ class DMT(nn.Module):
                 )
             else:
                 self.cond_encoder = StmEncoder(
-                    # = len(f[split].attrs['z_slices']); 14 for /scratch/project_2001912/stm-data.
                     in_channels=getattr(config.model, 'stm_in_channels', 14),
                     conv3d_channels=tuple(getattr(config.model, 'stm_conv3d_channels',
                                                   (4, 8, 16))),
@@ -361,8 +323,6 @@ class DMT(nn.Module):
 
         if self.cond_encoder_kind == 'ters':
             if specformer_ckpt:
-                # These weights cannot fit a conv trunk. Loading would match zero keys and
-                # silently train from scratch, so refuse instead of printing a warning.
                 raise ValueError(
                     'config.model.pretrained_specformer_path is set but the TERS encoder is '
                     'a conv trunk, not a SpecFormer -- no key would match. Use '
@@ -374,30 +334,21 @@ class DMT(nn.Module):
             else:
                 print("Train TersEncoder from scratch")
         elif self.cond_encoder_kind == 'stm':
-            # --- ADDED (stm): same refuse-loudly rule as the TERS branch above. SpecFormer
-            # weights cannot fit a 3D conv stem, so loading would match zero keys and train
-            # from scratch while the log claimed otherwise.
             if specformer_ckpt:
                 raise ValueError(
                     'config.model.pretrained_specformer_path is set but the STM encoder is '
                     'a 3D conv trunk, not a SpecFormer -- no key would match. Clear it to '
                     'train from scratch.')
-            # --- ADDED (stm-clip): load the contrastively pretrained weights ------------
             stm_ckpt = getattr(config.model, 'pretrained_stm_encoder_path', '')
             if stm_ckpt and self.stm_version != 'clip':
-                # REFUSAL, recorded in docs/07-change-manifest.md 5. This checkpoint's 2D
-                # half is key- AND shape-identical to v1's, so load_pretrained_ters_encoder
-                # would match 31 of v1's 40 tensors -- a random 3D stem and a random head --
-                # and print "Loaded 31/40" without raising. A partial load of a pretrained
-                # encoder is not a warning, it is a different experiment.
                 raise ValueError(
                     f'config.model.pretrained_stm_encoder_path is set but '
-                    f'config.model.stm_encoder is {self.stm_version!r}. Those weights are '
-                    f"a StmCubeEncoder's; {self.stm_version} has a different 3D stem and "
-                    f'would load only its 2D trunk while logging success. Set '
+                    f'config.model.stm_encoder is {self.stm_version!r}. Those weights belong '
+                    f'to StmCubeEncoder; {self.stm_version} has a different 3D stem, so only '
+                    f'its 2D trunk would load. Set '
                     f"config.model.stm_encoder='clip', or clear the checkpoint path.")
             if stm_ckpt:
-                print('Load pretrained StmCubeEncoder (contrastive, ters-clip job 1264302)')
+                print('Load pretrained StmCubeEncoder (contrastive)')
                 load_pretrained_stm_cube_encoder(self.cond_encoder, stm_ckpt)
             else:
                 print(f"Train {type(self.cond_encoder).__name__} from scratch "
@@ -410,15 +361,11 @@ class DMT(nn.Module):
             print("Train SpecFormer from scratch")
 
     def load_pretrained_ters_encoder(self, ckpt_path):
-        """Load an MT AttentionUNet checkpoint into the ported encoder trunk.
+        """Load encoder weights from an ``AttentionUNet`` checkpoint into ``TersEncoder``.
 
-        Only the trunk can transfer: MT's decoder, attention gates and output conv have no
-        counterpart here, and the pooling head is new. Unlike
-        ``load_pretrained_specformer``, a zero-key match **raises** -- silently training from
-        scratch while the log says "Load pretrained" is the failure mode worth preventing.
-
-        Untested against a real MT checkpoint: the MT repo is not mounted here (D-3), so the
-        prefix list below is from docs/02-reuse-map.md 4 and may need extending.
+        Tensors are matched by name and shape; unmatched ones, such as the pooling head, keep
+        their initialisation. Raises ``ValueError`` if none match. Not yet tested on a real
+        checkpoint.
         """
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)

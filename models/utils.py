@@ -22,9 +22,21 @@ def register_model(cls=None, *, name=None):
 
 
 def create_model(config):
+    """Build the model and wrap it in DataParallel, or DistributedDataParallel if
+    ``config.training.ddp`` is set."""
     model = _MODELS[config.model.name](config)
     model = model.to(config.device)
-    model = torch.nn.DataParallel(model)
+
+    if bool(getattr(config.training, 'ddp', False)):
+        import distributed
+        local_rank = distributed.slurm_topology()[2]
+        # find_unused_parameters must stay True: DMT.forward skips dist_layer on steps without
+        # self-conditioning, so its parameters get no gradient then.
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[local_rank], output_device=local_rank,
+            find_unused_parameters=bool(getattr(config.training, 'ddp_find_unused', True)))
+    else:
+        model = torch.nn.DataParallel(model)
     return model
 
 

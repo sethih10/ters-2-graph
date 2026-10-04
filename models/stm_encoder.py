@@ -1,126 +1,37 @@
-"""Conditioning encoder for STM z-stacks (``/scratch/project_2001912/stm-data``).
+"""3D convolutional encoder for STM z-stacks.
 
-Drop-in sibling of :class:`~models.ters_encoder.TersEncoder`.  Same contract, so nothing in
-the denoiser moves: ``(B, C, H, W) -> (B, output_dim)``, consumed by ``cond_lin`` at
-models/dmt.py:348-349.
+Maps a z-stack ``(B, C, H, W)``, C = z-slices, to ``(B, output_dim)``. Selected with
+``config.model.stm_encoder = 'v1'`` (the default). Inputs must be normalised with
+``NormalizeStmCube``.
 
-Why this is not just ``TersEncoder(in_channels=14)``
----------------------------------------------------
-Mechanically it could be -- the tensor contract is identical.  The reason it is not is that
-**the channel axis means something different in the two datasets.**
-
-  * TERS: 100 *spectral* bins.  Unordered as far as the network is concerned; a 1x1 conv
-    stem that freely mixes them is exactly right.
-  * STM: 14 *constant-height slices* at z = 6..19 (``val.attrs['z_slices']``).  The axis is
-    a physical distance, it is monotonically ordered, and the signal decays smoothly along
-    it (measured per-slice means, 64 val cubes: 0.083 -> 0.019, a clean geometric decay).
-    That decay envelope *is* the height information.  A 1x1 stem can represent it but has no
-    inductive bias for it; a 3D convolution reads it directly.
-
-This is the same argument the AFM structure-discovery literature settled on -- see the
-provenance block -- and it is why this file exists rather than a config knob.
-
-Provenance (ladder in docs/README.md; ledger in docs/02-reuse-map.md)
---------------------------------------------------------------------
-  * ``ResBlock``, ``_groups_for``  -- **REUSE**, imported unmodified from
-        models/ters_encoder.py:47 and :29.  The GroupNorm-instead-of-BatchNorm argument
-        recorded there (DataParallel computes BatchNorm stats per replica) applies here
-        verbatim, so the block is taken as-is rather than re-derived.
-  * 3D stem (``Conv3d`` 1->4->8->16, k=3, ``AvgPool3d``, z-to-channels flatten)
-                                   -- **ADAPT** of ``ASDAFMNet`` in SINGROUP/ml-spm
-        (``mlspm/image/models.py``), the reference implementation for Alldritt et al.,
-        "Automated structure discovery in atomic force microscopy", Sci. Adv. 6, eaay6913
-        (2020).  That model reads a stack of constant-height AFM images with three 3x3x3
-        ``Conv3d`` layers interleaved with ``AvgPool3d``, doubling channels while the
-        pooling "collapses the data in the z direction from 3D to 2D", then flattens the
-        surviving z into channels.  Kept: layer count, kernel size, the 4/8/16 widths, the
-        replicate padding, LeakyReLU(0.1), and the (2,2,2),(2,2,2),(2,2,1) pool schedule.
-        Dropped: everything after the bottleneck -- ASDAFMNet is an encoder/decoder that
-        predicts an image, we need a vector.
-  * pooling head, ``out_norm``, ``reset_parameters``
-                                   -- **REUSE** of the interface TersEncoder exposes at
-        models/ters_encoder.py:129-141, so swapping encoders stays a one-line change and
-        ``cond_lin`` sees an identically-scaled input either way.
-  * ``NormalizeStmCube``           -- **NEW**.  Defended below; the existing
-        ``NormalizeVectorized`` is measurably wrong for this data.
-
-.. warning::
-   The ADAPT row was reconstructed from the published description of ``ASDAFMNet`` and the
-   paper, not by importing ``mlspm`` (it is not a dependency here, and adding one would
-   violate docs/06-code-practices.md 8).  Shapes and training behaviour are verified by
-   ``--self-test``; layer-for-layer correspondence with ``mlspm`` is not.  Do not load an
-   ``asdafm-light``/``asdafm-heavy`` checkpoint into this without diffing first.
-
-Checked first and rejected:
-  * ``TersEncoder`` -- see above; kept as the ablation baseline, not the default.
-  * ``models/layers.py`` -- graph message passing only, no convolution of any rank.
-  * ``SpecFormer`` -- 1-D token sequences; a 14x128x128 stack is not a spectrum.
+3D stem adapted from ml-spm ``ASDAFMNet`` (mlspm/image/models.py; Alldritt et al., Sci. Adv. 6,
+eaay6913, 2020); its decoder is replaced by a 2D residual trunk and pooled head.
 
 Usage
 -----
-    python -m models.stm_encoder --self-test                       # no data needed
-    python -m models.stm_encoder --inspect /scratch/project_2001912/stm-data/val.h5
-    python -m models.stm_encoder --check   /scratch/project_2001912/stm-data/val.h5
+    python -m models.stm_encoder --self-test
+    python -m models.stm_encoder --inspect H5
+    python -m models.stm_encoder --check H5
 """
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-# REUSE, not re-derivation: these are the TERS blocks, unmodified.  If the GroupNorm choice
-# is ever revisited there, both encoders must move together -- which is the point of importing
-# rather than copying.
 from .ters_encoder import ResBlock, _groups_for
 
 
 class NormalizeStmCube:
-    """Per-cube normalisation for an STM z-stack.  NEW -- and deliberately *not*
-    ``NormalizeVectorized`` (datasets/ters_dataset.py:31).
-
-    **Why the TERS normaliser is wrong here.** ``NormalizeVectorized`` standardises each
-    channel independently over ``(H, W)``.  On TERS that is right: spectral bins have
-    unrelated units and dead channels to guard against.  On an STM z-stack it forces every
-    slice to mean 0 and std 1 *separately*, which deletes the decay envelope across z --
-    the one thing that distinguishes slice 6 from slice 19.  Measured on 64 val cubes:
-
-        raw (x/65535)          per-slice mean, first -> last:  +0.083 -> +0.019
-        per-slice standardised per-slice mean, first -> last:  -0.000 -> -0.000
-
-    The envelope is not attenuated, it is *gone*.  Feeding that to a 3D conv stem whose
-    entire purpose is to read along z would be self-defeating.
-
-    **What this does instead**, in three steps:
-
-    1. ``x / 65535`` undoes the uint16 packing.  The file stores ``uint16 per-sample
-       max-scaled`` with ``recover = X.astype(float32) * scale[i]`` (root attrs).  The
-       per-sample ``scale`` is a single constant per cube, so for a *conditioning* encoder
-       -- which only ever sees one cube at a time and is followed by a LayerNorm -- it is an
-       irrelevant global gain.  Dropping it keeps every cube on a common [0, 1] axis instead
-       of spreading them over the ~1e-12..1e-11 range the raw scales span.  If absolute
-       current ever matters downstream, that is what ``scale`` is for; it is not lost, just
-       not used here.
-    2. ``asinh(x / asinh_scale)`` tames the skew.  The distribution is extreme: median
-       0.0032 but p99 0.527, i.e. the 99th percentile sits 5.2 sigma out, so a handful of
-       bright pixels would dominate any linear normalisation.  ``asinh`` is linear for
-       ``x << s`` and logarithmic for ``x >> s``, and unlike ``log`` it is defined at 0
-       (7.4% of pixels are exactly 0).  The default ``s = 0.01`` puts the median at 0.32 s
-       -- in the linear regime -- and p99 at 53 s, deep in the log regime, so the transform
-       compresses precisely the tail and leaves the bulk alone.
-    3. Standardise over **the whole cube at once**, not per slice.  This is the step that
-       preserves the ordering: after it the per-slice means still run monotonically
-       (+0.249 -> -0.229 on the same 64 cubes), so the envelope survives into the stem.
+    """Normalise one STM z-stack: divide, asinh-compress, then standardise over the whole cube.
 
     Parameters
     ----------
     uint16_max : float
-        Divisor for step 1.  Set to ``1.0`` if the cube was already converted to float.
-    asinh_scale : float
-        ``s`` in step 2.  ``None`` disables the compression (linear normalisation).
+        Divisor applied first; ``1.0`` if the cube is already float.
+    asinh_scale : float or None
+        ``s`` in ``asinh(x / s)``; ``None`` disables the compression.
     eps : float
-        Zero-std guard, same role as in ``NormalizeVectorized``.  A whole cube being
-        constant is pathological rather than routine here -- unlike TERS, no dead slice was
-        found (min per-sample-per-slice std over 64x14 slices was 0.029) -- but a corrupt
-        record should produce zeros, not NaN.
+        If the cube's standard deviation is below this, it is only mean-centred.
     """
 
     def __init__(self, uint16_max=65535.0, asinh_scale=0.01, eps=1e-6):
@@ -142,39 +53,29 @@ class NormalizeStmCube:
 
 
 class StmEncoder(nn.Module):
-    """STM z-stack -> a single conditioning vector.
+    """Encode an STM z-stack ``(B, C, H, W)`` into ``(B, output_dim)``.
 
-    Input is the same channels-first cube the TERS path uses, ``(B, C, H, W)`` with
-    ``C`` = number of z-slices, so the dataset/collate contract is unchanged.  Internally it
-    is treated as a single-channel 3D volume ``(B, 1, D, H, W)`` with ``D = C``, which is
-    what lets the stem convolve *along* z instead of mixing z as unordered features.
+    The C z-slices form the depth of a single-channel volume: a 3D convolutional stem, z folded
+    into channels, a 2D residual trunk and a pooled linear head.
 
     Parameters
     ----------
     in_channels : int
-        Number of z-slices.  14 for this corpus (``z_slices`` 6..19).  This is also ``D``,
-        so it is needed at construction: the z-pooling schedule and hence the width handed
-        to the 2D trunk depend on it.
+        Number of z-slices.
     conv3d_channels : tuple of int
-        Widths of the 3D stem.  ``(4, 8, 16)`` is the ASDAFMNet ladder.
+        Widths of the 3D stem layers.
     filters : tuple of int
-        Widths of the 2D ResBlock ladder after the z-collapse.  Shorter than TersEncoder's
-        ``(64, 128, 256, 512)`` on purpose: the stem has already downsampled 8x spatially
-        (128 -> 16), so a fourth block would pool a 2x2 map.
+        Widths of the 2D trunk.
     output_dim : int
-        Must equal ``config.model.nf`` -- ``cond_lin`` is ``Linear(hidden_dim, time_dim)``
-        (models/dmt.py:262).  256 for the current configs.
+        Embedding size; must equal ``config.model.nf``.
     pool_size : int
-        Spatial grid kept by the head before flattening; ``1`` is a global average pool.
-        Same knob and same rationale as ``TersEncoder.pool_size`` (docs/experimental.md E-1).
+        Spatial grid size before the head; 1 is global average pooling.
     """
 
     def __init__(self, in_channels=14, conv3d_channels=(4, 8, 16), filters=(64, 128, 256),
                  kernel_size=None, output_dim=256, n_groups=8, pool_size=1,
                  padding_mode='replicate', negative_slope=0.1):
         super().__init__()
-        # Default tracks len(filters) instead of being a fixed 3-tuple, so overriding
-        # `filters` alone (the knob anyone actually turns) cannot raise below.
         if kernel_size is None:
             kernel_size = (3,) * len(filters)
         if len(kernel_size) != len(filters):
@@ -192,11 +93,7 @@ class StmEncoder(nn.Module):
         self.pool_size = pool_size
         self.negative_slope = negative_slope
 
-        # --- NEW (stm): 3D stem, ADAPT of ASDAFMNet -----------------------------------
-        # Conv3d over (D, H, W) with D = z.  padding=1 with 'replicate' keeps the slice
-        # count intact through the convs -- zero-padding would invent two phantom slices
-        # below and above the measured range, and the boundary slices are the informative
-        # ones (slice 6 is nearest the molecule).
+        # 3D stem
         widths_3d = [1] + list(conv3d_channels)
         self.conv3d = nn.ModuleList([
             nn.Conv3d(widths_3d[i], widths_3d[i + 1], kernel_size=3, padding=1,
@@ -204,11 +101,6 @@ class StmEncoder(nn.Module):
             for i in range(len(conv3d_channels))
         ])
 
-        # The z-pool schedule is fixed at construction, not chosen per batch, because the
-        # surviving depth sets the width of the 2D projection below.  It is derivable
-        # because D == in_channels is enforced in forward().  Mirrors ASDAFMNet's
-        # (2,2,2),(2,2,2),(2,2,1): pool z on every stage but the last, and never pool a
-        # depth that would floor to 0.
         n_stages = len(conv3d_channels)
         d = in_channels
         z_kernels = []
@@ -219,9 +111,7 @@ class StmEncoder(nn.Module):
         self.z_kernels = tuple(z_kernels)
         self.z_out = d
 
-        # Flatten the surviving z into channels (ASDAFMNet's `_flatten_z_to_channels`), then
-        # a 1x1 conv to the trunk width -- the same role TersEncoder's spectral stem plays,
-        # except the mixing here is over (z x feature) pairs rather than raw spectral bins.
+        # Fold z into channels, then the 2D trunk.
         self.flat_channels = conv3d_channels[-1] * self.z_out
         self.proj = nn.Conv2d(self.flat_channels, filters[0], kernel_size=1)
 
@@ -237,26 +127,18 @@ class StmEncoder(nn.Module):
             nn.Flatten(),
             nn.Linear(filters[-1] * pool_size * pool_size, output_dim),
         )
-        # Mirrors SpecFormer.out_norm (models/specformer.py:67) and TersEncoder.out_norm.
-        # cond_lin was initialised for a LayerNorm-scaled input; handing it raw pooled
-        # activations changes the scale of what gets added to time_emb at models/dmt.py:354.
         self.out_norm = nn.LayerNorm(output_dim)
 
-        # One-shot input-scale check (docs/06-code-practices.md 5: make silent failures
-        # loud).  Forgetting NormalizeStmCube leaves values in 0..65535, which does not
-        # crash -- it just trains badly and slowly, which is the expensive failure.  A
-        # buffer rather than a plain attribute so it survives DataParallel replication.
+        # Non-persistent, so it is not part of state_dict.
         self.register_buffer('_scale_checked', torch.zeros(1, dtype=torch.bool),
                              persistent=False)
 
         self.reset_parameters()
 
     def reset_parameters(self):
-        """Matches the interface SpecFormer exposes at models/specformer.py:70-73."""
+        """Initialise weights."""
         for m in self.modules():
             if isinstance(m, nn.Conv3d):
-                # The 3D stem is LeakyReLU, not ReLU; using the ReLU gain here would
-                # under-scale it by sqrt(2/(1+0.1^2)).
                 nn.init.kaiming_normal_(m.weight, a=self.negative_slope,
                                         nonlinearity='leaky_relu')
                 if m.bias is not None:
@@ -270,16 +152,17 @@ class StmEncoder(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def _check_scale(self, x):
+        """Warn once if the input looks unnormalised (raw uint16 values)."""
         if bool(self._scale_checked):
             return
         self._scale_checked.fill_(True)
         absmax = float(x.detach().abs().max())
         if absmax > 100.0:
             print(f'[StmEncoder] WARNING: input |max| = {absmax:.4g}. The raw HDF5 is '
-                  f'uint16 (0..65535); this looks unnormalised. Wire '
-                  f'models.stm_encoder.NormalizeStmCube into the dataset transform -- '
-                  f'NOT datasets.ters_dataset.NormalizeVectorized, which standardises each '
-                  f'z-slice separately and deletes the decay envelope this encoder reads.')
+                  f'uint16 (0..65535); this looks unnormalised. Use '
+                  f'models.stm_encoder.NormalizeStmCube in the dataset transform, not '
+                  f'datasets.ters_dataset.NormalizeVectorized, which standardises each '
+                  f'z-slice separately and removes the decay envelope this encoder reads.')
 
     def forward(self, x):
         if x.dim() != 4:
@@ -294,45 +177,33 @@ class StmEncoder(nn.Module):
                 f"(len(f[split].attrs['z_slices'])).")
         self._check_scale(x)
 
-        # (B, C, H, W) -> (B, 1, D, H, W): one input feature map, z as a real spatial axis.
-        h = x.unsqueeze(1)
+        h = x.unsqueeze(1)                                    # (B, 1, Z, H, W)
         for i, conv in enumerate(self.conv3d):
             h = F.leaky_relu(conv(h), negative_slope=self.negative_slope)
-            # H, W are pooled dynamically so any input resolution works (AdaptiveAvgPool2d
-            # in the head absorbs whatever survives), but the z kernel is the fixed
-            # schedule from __init__ -- self.flat_channels depends on it.
+            # H, W pool only while >= 2; z follows the fixed schedule that sets flat_channels.
             sk = 2 if min(h.shape[-2:]) >= 2 else 1
             zk = self.z_kernels[i]
             if sk > 1 or zk > 1:
                 h = F.avg_pool3d(h, kernel_size=(zk, sk, sk), stride=(zk, sk, sk))
 
-        # z -> channels.  reshape, not mean: averaging over z here would undo the whole
-        # reason for the 3D stem.
         b, c, d, hh, ww = h.shape
-        h = h.reshape(b, c * d, hh, ww)
+        h = h.reshape(b, c * d, hh, ww)                       # (B, C * Z, H, W)
 
         h = self.proj(h)
         for block in self.blocks:
             h = block(h)
-            # Same guard as TersEncoder: stop halving once there is nothing left to halve.
+            # Stop pooling once a side is below 2, so small inputs do not shrink to size 0.
             if min(h.shape[-2:]) >= 2:
                 h = self.pool(h)
         return self.out_norm(self.head(h))
 
 
 # ---------------------------------------------------------------------------------------
-# --- NEW (stm): --self-test / --inspect / --check, per docs/06-code-practices.md 3 ------
+# Command-line checks
 # ---------------------------------------------------------------------------------------
 
 def _self_test():
-    """Exercise the encoder with no HDF5 and no cluster.
-
-    Cases are chosen to cover the failure modes, not to look thorough:
-      14 slices @ 128x128  the real corpus geometry
-      10 slices @  64x64   the ASD-STM slice count, odd resolution ladder
-       1 slice  @ 128x128  degenerate z -- proves the z-pool schedule never floors to 0
-      14 slices @  16x16   small input -- proves the spatial guard holds
-    """
+    """Check shapes, gradients and the normaliser on random input."""
     torch.manual_seed(0)
     cases = [(14, 128, 128), (10, 64, 64), (1, 128, 128), (14, 16, 16)]
     ok = 0
@@ -351,20 +222,9 @@ def _self_test():
               f'flat={enc.flat_channels:4d}  params={n/1e6:.2f}M')
         ok += 1
 
-    # The normaliser is the part most likely to be got wrong by reuse, so test the property
-    # that motivated it: the z envelope must survive.
-    #
-    # The cube plants ONE spatial pattern scaled by a decay envelope, rather than 14
-    # independently drawn slices.  That is deliberate.  `asinh` is a per-pixel
-    # nonlinearity, so a slice mean after the transform depends on the slice's whole
-    # distribution, not just its mean -- give every slice its own random content and the
-    # per-slice means come out non-monotone *before* normalisation ever runs (measured:
-    # 2 inversions in 13 on a seed-0 cube), which would make this test assert something
-    # neither this transform nor any other could deliver.  With a shared pattern, strict
-    # ordering IS an invariant: a monotone per-pixel map applied to a uniformly scaled
-    # slice must preserve the order of the means.  So an inversion here is a real bug.
+    # Slice means must stay monotone in z; the test cube is one pattern scaled per slice.
     base = torch.rand(1, 32, 32) ** 3 * 65535.0
-    envelope = torch.linspace(1.0, 0.22, 14).view(14, 1, 1)       # measured decay, 0.083->0.019
+    envelope = torch.linspace(1.0, 0.22, 14).view(14, 1, 1)
     norm = NormalizeStmCube()(base * envelope)
     means = norm.mean(dim=(1, 2))
     assert torch.all(means[:-1] > means[1:]), 'NormalizeStmCube destroyed the z envelope'
@@ -373,19 +233,17 @@ def _self_test():
           f'{float(means[0]):+.3f} -> {float(means[-1]):+.3f}')
     ok += 1
 
-    # The contrast that motivated the class: the TERS normaliser on the same cube.  Assert
-    # it, do not just claim it in a docstring -- if datasets/ters_dataset.py ever changes
-    # so that this no longer holds, the reason this file exists has changed with it.
+    # NormalizeVectorized must flatten every slice mean of the same cube.
     from datasets.ters_dataset import NormalizeVectorized
     ters_means = NormalizeVectorized()(base * envelope).mean(dim=(1, 2))
     assert float(ters_means.abs().max()) < 1e-4, (
         'NormalizeVectorized no longer flattens each slice -- re-check whether StmEncoder '
         'still needs its own normaliser')
     print(f'  ok  NormalizeVectorized (TERS) flattens the same envelope to '
-          f'{float(ters_means[0]):+.3f} -> {float(ters_means[-1]):+.3f}  (why this class exists)')
+          f'{float(ters_means[0]):+.3f} -> {float(ters_means[-1]):+.3f}')
     ok += 1
 
-    # And the property that would silently break it: a constant cube must not yield NaN.
+    # A constant cube must not yield NaN.
     flat = NormalizeStmCube()(torch.full((14, 8, 8), 1234.0))
     assert torch.isfinite(flat).all(), 'constant cube produced non-finite values'
     print('  ok  constant cube -> finite (zero-std guard)')
@@ -396,7 +254,7 @@ def _self_test():
 
 
 def _inspect(h5_path):
-    """Print the HDF5 layout and exit.  Run this before anything else touches a new file."""
+    """Print the groups, attributes and dataset shapes of an HDF5 file."""
     import h5py
 
     with h5py.File(h5_path, 'r') as f:
@@ -415,11 +273,7 @@ def _inspect(h5_path):
 
 
 def _check(h5_path, split=None, n=8):
-    """Push real cubes through the real normaliser and the real encoder.
-
-    This is the step that turns "the shapes look right" into "this consumes the corpus":
-    it reads the z-slice count out of the file rather than trusting the default.
-    """
+    """Run the first ``n`` cubes of a split through ``NormalizeStmCube`` and ``StmEncoder``."""
     import h5py
     import numpy as np
 

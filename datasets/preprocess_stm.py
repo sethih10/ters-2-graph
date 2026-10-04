@@ -1,39 +1,8 @@
-"""Build the graph sidecar for the STM corpus at ``/scratch/project_2001912/stm-data``.
+"""Build graph sidecars for the STM corpus at ``/scratch/project_2001912/stm-data``.
 
-Counterpart to :mod:`datasets.preprocess_ters`, and mostly a thin driver over it: the
-geometry -> bond-order -> kekulize -> encode pipeline is *identical*, only the source of the
-geometry differs.  What this module contributes is the STM-specific half -- reading the
-packed ``xyz`` block, the ten-element type map, and the census/statistics that a new corpus
-needs before a config can be written.
-
-Provenance (ladder in docs/README.md):
-  * ``mol_from_geometry``, ``encode_graph``, ``check_record``, ``geometry_stats``,
-    ``build_xyz_block``, ``covalent_bond_fallback``
-                              -- **REUSE**, imported from datasets/preprocess_ters.py.
-        ``encode_graph`` and ``check_record`` grew a ``types=`` parameter for this (both
-        default to the H/C/N/O map, so the TERS path is unaffected); nothing else moved.
-  * ``iter_molecules``        -- **NEW**.  TERS stores geometry as HDF5 *groups* keyed
-        ``'0'..'N-1'``; STM stores one dense zero-padded ``(N, 54, 5)`` array.  Neither
-        ``iter_molecules`` nor ``_numeric_group_accessor`` in the TERS module can read that,
-        and the padding convention is the whole content of the function.
-  * ``STM_TYPES``, ``census`` -- **NEW**.
-
-The layout, from ``--inspect`` (do not trust this comment over the file):
-
-    X      (N, 128, 128, 14)  uint16   the image cube -- not read here
-    xyz    (N, 54, 5)         float32  (x, y, z, Z, partial_charge), zero-padded to 54
-    cid    (N,)               object   PubChem CID
-    scale  (N,)               float32  per-sample cube scale -- not read here
-
-.. warning::
-   **Column 4 of ``xyz`` is a *partial* charge, not a formal charge.**  Measured range
-   -0.789..+1.241 with a continuous distribution (e.g. -0.630, -0.615, -0.609), so it is a
-   fractional per-atom charge from the electronic-structure calculation.  ``fc`` in the
-   encoded record is an *integer formal* charge and is a real feature channel consumed by
-   ``CollateSpectra.__call__`` (datasets/build_dataset.py:430).  Writing the partial charge
-   into it would train the model to predict a charge state no molecule has.  So the column
-   is **deliberately not used**: ``encode_graph`` takes RDKit's assigned formal charges,
-   exactly as the TERS path does.  It is kept in ``--census`` output only as a diagnostic.
+Uses the bond inference and encoding of :mod:`datasets.preprocess_ters` with a ten-element
+type map. Each split group's ``xyz`` rows are ``(x, y, z, Z, partial_charge)``, zero-padded;
+the partial charge is not a formal charge and is not used as ``fc``.
 
 Usage
 -----
@@ -53,8 +22,6 @@ from collections import Counter
 import numpy as np
 import torch
 
-# REUSE: the entire RDKit half. Imported, not copied -- a second implementation of the
-# (row * N + col) edge ordering or the kekulization step is a bug waiting to happen.
 from .preprocess_ters import (
     ATOMIC_SYMBOLS,
     check_record,
@@ -63,11 +30,7 @@ from .preprocess_ters import (
     mol_from_geometry,
 )
 
-# --- NEW (stm): ten-element type map ---------------------------------------------------
-# MEASURED over 4000 val molecules, not assumed: H, C, N, O, F, Si, P, S, Cl, Br. The TERS
-# map is four elements; reusing it would raise on ~4% of atoms (F/Si/P/S/Cl/Br) and silently
-# drop those molecules through the failure path.
-# Ordered by atomic number, which is the convention datasets/qm9s_dataset.py:206 follows.
+# Atomic number -> node index; order must match the ``stm_10elem`` atom_encoder.
 STM_TYPES = {1: 0, 6: 1, 7: 2, 8: 3, 9: 4, 14: 5, 15: 6, 16: 7, 17: 8, 35: 9}
 STM_SYMBOLS = [ATOMIC_SYMBOLS[z] for z in sorted(STM_TYPES, key=STM_TYPES.get)]
 
@@ -76,11 +39,7 @@ CUBE_KEY = 'X'
 
 
 def _split_group(f, split=None):
-    """The STM files nest everything one level down, under the split name.
-
-    ``val.h5`` holds a single group ``'val'``; the split name is therefore discoverable
-    rather than something the caller has to know.  Returns ``(name, group)``.
-    """
+    """Return ``(name, group)`` for the split group; inferred if the file has only one."""
     keys = [k for k in f.keys() if hasattr(f[k], 'keys')]
     if split is not None:
         if split not in f:
@@ -94,21 +53,15 @@ def _split_group(f, split=None):
 
 
 def iter_molecules(group, limit=None):
-    """Yield ``(index, Z, pos, cid)`` per molecule, padding stripped.  NEW.
+    """Yield ``(index, Z, pos, cid)`` per molecule with padding removed.
 
-    The ``xyz`` array is zero-padded to 54 rows; a padding row is all-zero, and in
-    particular has ``Z == 0``.  **Filtering on ``Z`` and not on the coordinates is the
-    point**: a real atom can legitimately sit at the origin (measured x-minimum is 0.039 A,
-    and y/z both cross zero), so an all-zero-coordinate test would drop real atoms in some
-    molecules and keep the count silently wrong.  ``Z == 0`` is not a real element, so it is
-    unambiguous.
+    Padding is detected by ``Z == 0``, not by zero coordinates: a real atom can sit at the origin.
     """
     xyz = group[XYZ_KEY]
     cids = group['cid'] if 'cid' in group else None
     n = xyz.shape[0] if limit is None else min(limit, xyz.shape[0])
 
-    # Read in slabs: the array is (N, 54, 5) float32 = ~1 KB per molecule, so a 4096-row
-    # slab is 4 MB, but one read per molecule over 184k molecules is 184k HDF5 round trips.
+    # Read in slabs rather than one HDF5 read per molecule.
     slab = 4096
     for start in range(0, n, slab):
         stop = min(start + slab, n)
@@ -126,12 +79,7 @@ def iter_molecules(group, limit=None):
 
 
 def census(h5_path, split=None, limit=None):
-    """Element / size / geometry census over the raw ``xyz`` block.  NEW.
-
-    Run before writing a config: it is what pins ``data.atom_types``, ``data.max_node`` and
-    the element map, and it costs one pass over a 1 KB-per-molecule array rather than the
-    52 GB of cubes.
-    """
+    """Count elements, molecule sizes and the partial-charge range in the raw ``xyz`` array."""
     import h5py
 
     elements, sizes = Counter(), Counter()
@@ -147,7 +95,6 @@ def census(h5_path, split=None, limit=None):
                 continue
             elements.update(int(v) for v in z)
             sizes[len(z)] += 1
-        # separate small pass for the diagnostic charge range (see the module warning)
         probe = np.asarray(raw_charges[:min(2048, total)])
         mask = probe[..., 3] > 0
         charge_min = float(probe[..., 4][mask].min())
@@ -176,7 +123,7 @@ def census(h5_path, split=None, limit=None):
 
 
 def inspect(h5_path):
-    """Print the HDF5 layout and exit.  Run this first on any new file."""
+    """Print the HDF5 layout, including group attributes."""
     import h5py
 
     with h5py.File(h5_path, 'r') as f:
@@ -197,15 +144,13 @@ def inspect(h5_path):
 
 def process_split(h5_path, out_path, split=None, charge=0, allow_fallback=True,
                   want_stats=False, check=True, limit=None):
-    """Build one sidecar.  Returns a summary dict.
+    """Build one sidecar with the ten-element map and return a summary dict.
 
-    Mirrors ``preprocess_ters.process_split`` -- same failure accounting, same 90 % survival
-    warning, same ``.failures.json`` / ``.stats.json`` sidecars -- over the STM iterator and
-    the ten-element map.
+    Also writes ``<out>.failures.json`` and, with ``want_stats``, ``<out>.stats.json``.
     """
     import h5py
     from rdkit import RDLogger
-    RDLogger.DisableLog('rdApp.*')      # mirrors datasets/qm9s_dataset.py:198
+    RDLogger.DisableLog('rdApp.*')
 
     with h5py.File(h5_path, 'r') as f:
         name, g = _split_group(f, split)
@@ -229,14 +174,12 @@ def process_split(h5_path, out_path, split=None, charge=0, allow_fallback=True,
                                      error=f'{type(exc).__name__}: {exc}'))
                 continue
             rec['used_fallback'] = used_fallback
-            # Provenance per record, so a downstream exclusion can name the molecule
-            # (docs/06-code-practices.md 9). CIDs are the only stable identifier here.
-            rec['cid'] = cid
+            rec['cid'] = cid                       # PubChem CID
             n_fallback += used_fallback
             n_aromatic_mols += n_aromatic > 0
             records.append(rec)
 
-    # The sidecar's h5_index must address the cube array, not the (filtered) record list.
+    # h5_index addresses the cube array, not the filtered record list.
     if n_cubes is not None and records:
         worst = max(int(r['h5_index']) for r in records)
         if worst >= n_cubes:
@@ -270,9 +213,8 @@ def process_split(h5_path, out_path, split=None, charge=0, allow_fallback=True,
                    n_molecules_with_aromatics=n_aromatic_mols)
 
     if want_stats and records:
-        stats = geometry_stats(records)        # REUSE -- element-agnostic
-        # The element histogram in the encoded records is the one that matters for the
-        # config: it counts what survived, not what the raw file contained.
+        stats = geometry_stats(records)
+        # Histograms over the encoded molecules only, unlike --census.
         kept_elements = Counter()
         node_hist = Counter()
         for r in records:
@@ -297,16 +239,10 @@ def process_split(h5_path, out_path, split=None, charge=0, allow_fallback=True,
 
 
 def geometry_symbols(sidecar_path, top_k=8, limit=None):
-    """The ``top_bond_sym`` / ``top_angle_sym`` / ``top_dihedral_sym`` lists for the config.
+    """Return the ``top_bond_sym`` / ``top_angle_sym`` / ``top_dihedral_sym`` config lists.
 
-    These three keys in ``datasets_config.py`` are consumed by ``evaluation/cal_geometry.py``
-    (lines 228, 292) to decide *which* bond/angle/dihedral populations to score, so they must
-    be built with that module's own symbol builders -- a hand-written 'C1C' that does not
-    match what ``get_bond_symbol`` emits scores an empty population and reports nothing,
-    silently.  So import the builders rather than reimplementing the string format.
-
-    Counted on the encoded ``rdmol`` objects, i.e. on molecules that actually survived, which
-    is the population the metric will run on.
+    Built with ``evaluation.cal_geometry``'s symbol builders; a symbol in any other format
+    matches nothing there.
     """
     from evaluation.cal_geometry import (
         get_bond_symbol, get_bond_pair_symbol, get_triple_bond_symbol,
@@ -353,11 +289,7 @@ def geometry_symbols(sidecar_path, top_k=8, limit=None):
 
 
 def atom_fc_census(sidecar_path):
-    """``atom_fc_num``: how often each (element, formal charge) pair occurs.
-
-    Consumed by ``check_2D_stability`` (evaluation/stability.py:80) to decide which charged
-    states are legitimate for this corpus.
-    """
+    """Return ``atom_fc_num``: counts of each non-zero (element, formal charge) pair."""
     records = torch.load(sidecar_path, weights_only=False)
     counts = Counter()
     for r in records:
@@ -368,18 +300,12 @@ def atom_fc_census(sidecar_path):
 
 
 def self_test():
-    """Exercise the STM-specific half with no HDF5.
-
-    The reusable RDKit half already has its own coverage in
-    ``preprocess_ters.self_test``; what is untested until here is the unpadding convention
-    and the ten-element map, so those are what this covers.
-    """
+    """Test unpadding and the ten-element map on synthetic molecules."""
     ok = 0
 
-    # 1. Unpadding. The planted molecule has a real atom AT THE ORIGIN, which is the case a
-    #    coordinate-based padding test gets wrong.
+    # 1. Unpadding must keep an atom at the origin.
     block = np.zeros((1, 54, 5), dtype=np.float32)
-    block[0, 0] = [0.0, 0.0, 0.0, 6, -0.1]          # carbon at the origin
+    block[0, 0] = [0.0, 0.0, 0.0, 6, -0.1]
     block[0, 1] = [1.09, 0.0, 0.0, 1, 0.03]
     block[0, 2] = [-0.36, 1.03, 0.0, 1, 0.03]
     block[0, 3] = [-0.36, -0.51, 0.89, 1, 0.03]
@@ -394,8 +320,7 @@ def self_test():
     print(f'  ok  unpadding keeps an atom at the origin  ({len(z)} atoms)')
     ok += 1
 
-    # 2. The ten-element map round-trips through the real encoder, including the elements
-    #    the TERS map does not have.
+    # 2. Elements outside the TERS map encode under STM_TYPES.
     from rdkit import RDLogger
     RDLogger.DisableLog('rdApp.*')
     cases = [
@@ -434,8 +359,7 @@ def self_test():
     else:
         raise AssertionError('an unmapped element did not raise')
 
-    # 4. The TERS map is untouched by the parameterisation -- this is the regression that
-    #    matters, because encode_graph is shared.
+    # 4. encode_graph's default element map must stay H/C/N/O.
     from .preprocess_ters import TYPES as TERS_TYPES
     assert TERS_TYPES == {1: 0, 6: 1, 7: 2, 8: 3}, 'the TERS element map changed'
     mol, _, _ = mol_from_geometry(np.array([6, 1, 1, 1, 1]),

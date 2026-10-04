@@ -1,32 +1,7 @@
-"""Pair the STM image cubes in the HDF5 with the graph sidecar from ``preprocess_stm.py``.
+"""Pair STM image cubes (HDF5) with the graph sidecar written by ``preprocess_stm.py``.
 
-The STM corpus is stored the same way the TERS one is -- a big lazily-read cube array plus a
-small in-RAM sidecar of graph targets carrying an ``h5_index`` back-pointer -- so this is a
-thin subclass of :class:`~datasets.ters_dataset.TersGraphDataset` rather than a second
-implementation.
-
-Provenance (ladder in docs/README.md):
-  * ``TersGraphDataset``  -- **REUSE** by subclassing.  The fork-safe lazy HDF5 open, the
-        ``__getstate__`` handle-stripping, the sidecar/cube length validation and the
-        ``load_cubes=False`` graph-only mode are inherited, not copied.  Those encode
-        conventions the whole pipeline depends on, and a divergent second copy is a bug
-        waiting to happen (the same argument ``CollateTers`` makes for subclassing
-        ``CollateSpectra``).
-  * ``NormalizeStmCube`` -- **REUSE**, imported from models/stm_encoder.py, so the encoder
-        and the dataset cannot disagree about what normalisation the encoder was designed
-        for.  It lives next to the encoder deliberately: the reason it exists is a property
-        of the encoder's 3D stem.
-  * key/split resolution, the three-way shape guard -- **NEW**.
-
-Three things differ from TERS, and they are the whole content of this file:
-
-1. **The cube lives one group down.**  TERS: ``f['channels_100']``.  STM: ``f['val']['X']``.
-   h5py resolves ``'val/X'`` as a path, so the inherited key handling works unchanged once
-   the split name is known -- and it is discoverable, so the caller does not have to pass it.
-2. **The normaliser.**  ``NormalizeVectorized`` standardises each channel over ``(H, W)``,
-   which on a z-stack flattens every slice to mean 0 and deletes the decay envelope along z.
-   Measured, and asserted in ``models/stm_encoder --self-test``.  See that module.
-3. **The attribute name.**  The cube is ``data.stm``, read by ``CollateStm``.
+``StmGraphDataset`` is a ``TersGraphDataset`` that reads the z-stack from ``'<split>/X'``,
+normalises it with ``NormalizeStmCube`` and stores it as ``data.stm`` for ``CollateStm``.
 
 Usage
 -----
@@ -44,12 +19,7 @@ CUBE_KEY = 'X'
 
 
 def resolve_cube_key(h5_path, split=None, cube_key=CUBE_KEY):
-    """``'<split>/X'``, with the split discovered when not given.
-
-    Done in the parent process on purpose (docs/06-code-practices.md 6): a wrong key inside
-    a DataLoader worker surfaces as a mangled traceback from a subprocess, and the fix is
-    always the same one sentence.
-    """
+    """Return the cube dataset path ``'<split>/X'``, inferring the split when not given."""
     import h5py
 
     with h5py.File(h5_path, 'r') as f:
@@ -79,29 +49,27 @@ class StmGraphDataset(TersGraphDataset):
     h5_path, graphs_path
         As ``TersGraphDataset``.
     split : str, optional
-        Group name inside the HDF5 (``'train'``/``'val'``/``'test'``).  Inferred from the
-        file when omitted -- each STM file holds exactly one.
+        Group name inside the HDF5; inferred when the file holds only one.
     normalize : bool or callable
-        ``True`` (default) uses ``NormalizeStmCube``.  **Not** ``NormalizeVectorized``:
-        see the module docstring.  Pass a callable to override, ``False`` to disable.
+        ``True`` uses ``NormalizeStmCube``; not ``NormalizeVectorized``, which removes the
+        decay along z. A callable overrides it, ``False`` disables it.
+    noise : callable, optional
+        As ``TersGraphDataset``, applied after ``normalize``.
     """
 
     cube_attr = 'stm'
 
     def __init__(self, h5_path, graphs_path, split=None, transform=None, normalize=True,
-                 load_cubes=True, cube_key=CUBE_KEY):
+                 load_cubes=True, cube_key=CUBE_KEY, noise=None):
         channels_key = (resolve_cube_key(h5_path, split, cube_key)
                         if load_cubes else f'{split or "train"}/{cube_key}')
         if normalize is True:
             normalize = NormalizeStmCube()
         super().__init__(h5_path=h5_path, graphs_path=graphs_path,
                          channels_key=channels_key, transform=transform,
-                         normalize=normalize, load_cubes=load_cubes)
+                         normalize=normalize, load_cubes=load_cubes, noise=noise)
 
-        # The parent validates 4 dims and reads in_channels from shape[3]; for STM that is
-        # the z-slice count, which is what StmEncoder(in_channels=) needs. Cross-check it
-        # against the file's own record of the slices so a corpus regenerated with a
-        # different z range cannot silently train a mismatched encoder.
+        # in_channels is the z-slice count; check it against the file's z_slices attribute.
         if load_cubes:
             self.n_z_slices = self.in_channels
             self._check_z_slices(h5_path, split)
@@ -141,7 +109,7 @@ def _smoke_test(h5_path, graphs_path, split=None):
     for k, v in batch.items():
         print(f'  {k:15s} {tuple(v.shape)}')
 
-    # The property the encoder depends on, checked on the real path rather than assumed.
+    # Per-slice means should decrease along z after normalisation.
     per_slice = batch['context'].mean(dim=(0, 2, 3))
     print(f'  per-slice mean {per_slice[0]:+.3f} -> {per_slice[-1]:+.3f}  '
           f'monotone={bool(torch.all(per_slice[:-1] > per_slice[1:]))}')

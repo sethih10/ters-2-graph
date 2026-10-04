@@ -35,7 +35,6 @@ def get_dataset(config, transform=True):
     if config.data.name == 'TERS':
         return _build_ters(config, transform, dataset_info)
 
-    # --- ADDED (stm): STM splits are on disk too, same five-tuple contract -----------------
     if config.data.name == 'STM':
         return _build_stm(config, transform, dataset_info)
 
@@ -62,23 +61,31 @@ def get_dataset(config, transform=True):
     return train_dataset, val_dataset, test_dataset, dataset_info
 
 
+def _cube_noise(config):
+    """Return ``AddCubeNoise`` from ``data.cube_noise_std``/``cube_noise_seed``, or None if off.
+
+    Applies to every split, including train.
+    """
+    from .ters_dataset import AddCubeNoise
+
+    std = float(getattr(config.data, 'cube_noise_std', 0.0))
+    if std <= 0.0:
+        return None
+    return AddCubeNoise(std=std, seed=int(getattr(config.data, 'cube_noise_seed', 0)))
+
+
 def _build_ters(config, transform, dataset_info):
-    """Phase 2 -- three TersGraphDataset splits, one per HDF5 file.
+    """Build three TersGraphDataset splits, one per HDF5 file.
 
-    Returns the five-tuple the ``'diffspectra'`` path expects, with the train set in both
-    slots: ``first_train`` feeds only the unconditional pre-training branch, and ``run_lib``
-    consumes ``second_train``.  Splitting is already done on disk (one HDF5 + one sidecar
-    per split), so this deliberately bypasses ``index_select`` and ``get_cond_idx_split`` --
-    those are ``InMemoryDataset`` APIs that a lazily-read HDF5 dataset does not have.
+    Returns the ``'diffspectra'`` five-tuple with the train set in both train slots.
 
-    Config keys (see configs/):
-        data.root        directory holding {train,val,test}.h5
-        data.graph_root  directory holding graphs_{split}.pt   (default: data.root)
-        data.ters_key    cube dataset name                     (default: channels_100)
-        data.load_cubes  read the image cubes at all           (default: True)
-
-    ``load_cubes=False`` is for the auxiliary config passed as ``--config_original_qm9``,
-    whose datasets are consumed only for ``.rdmol`` (run_lib.py:339-341). See configs/base_ters.py.
+    Config keys:
+        data.root             directory holding {train,val,test}.h5
+        data.graph_root       directory holding graphs_{split}.pt  (default: data.root)
+        data.ters_key         cube dataset name                    (default: channels_100)
+        data.load_cubes       read the image cubes                 (default: True)
+        data.cube_noise_std   noise std, fraction of per-channel signal std  (default: 0.0)
+        data.cube_noise_seed  noise seed                           (default: 0)
     """
     import os.path as osp
     from .ters_dataset import TersGraphDataset
@@ -87,6 +94,7 @@ def _build_ters(config, transform, dataset_info):
     graph_root = getattr(config.data, 'graph_root', root)
     channels_key = getattr(config.data, 'ters_key', 'channels_100')
     load_cubes = getattr(config.data, 'load_cubes', True)
+    noise = _cube_noise(config)
 
     def split(name):
         return TersGraphDataset(
@@ -95,6 +103,7 @@ def _build_ters(config, transform, dataset_info):
             channels_key=channels_key,
             transform=transform,
             load_cubes=load_cubes,
+            noise=noise,
         )
 
     train, val, test = split('train'), split('val'), split('test')
@@ -102,18 +111,11 @@ def _build_ters(config, transform, dataset_info):
 
 
 def _build_stm(config, transform, dataset_info):
-    """--- ADDED (stm): three StmGraphDataset splits, one per HDF5 file.
+    """Build three StmGraphDataset splits, one per HDF5 file.
 
-    Same five-tuple contract and the same reasoning as ``_build_ters`` above: splitting is
-    already done on disk (one HDF5 + one sidecar per split), so ``index_select`` and
-    ``get_cond_idx_split`` -- ``InMemoryDataset`` APIs a lazily-read HDF5 dataset does not
-    have -- are deliberately bypassed.
-
-    Config keys (see configs/diffspectra_stm.py):
-        data.root        directory holding {train,val,test}.h5
-        data.graph_root  directory holding graphs_{split}.pt   (default: data.root)
-        data.stm_key     cube dataset name inside the split group  (default: X)
-        data.load_cubes  read the image cubes at all           (default: True)
+    Returns the same five-tuple as ``_build_ters``. Config keys as ``_build_ters``, except
+    ``data.stm_key`` (cube dataset name inside the split group, default ``X``) replaces
+    ``data.ters_key``.
     """
     import os.path as osp
     from .stm_dataset import StmGraphDataset
@@ -122,18 +124,17 @@ def _build_stm(config, transform, dataset_info):
     graph_root = getattr(config.data, 'graph_root', root)
     cube_key = getattr(config.data, 'stm_key', 'X')
     load_cubes = getattr(config.data, 'load_cubes', True)
+    noise = _cube_noise(config)
 
     def split(name):
         return StmGraphDataset(
             h5_path=osp.join(root, f'{name}.h5'),
             graphs_path=osp.join(graph_root, f'graphs_{name}.pt'),
-            # Passed explicitly rather than inferred: the group inside train.h5 happens to
-            # be named 'train', but relying on that would break silently on a file whose
-            # group is named differently, and the caller always knows the split here.
             split=name,
             transform=transform,
             load_cubes=load_cubes,
             cube_key=cube_key,
+            noise=noise,
         )
 
     train, val, test = split('train'), split('val'), split('test')
@@ -141,11 +142,23 @@ def _build_stm(config, transform, dataset_info):
 
 
 def inf_iterator(iterable):
+    """Yield batches indefinitely, restarting the loader at each epoch boundary.
+
+    Calls ``sampler.set_epoch`` on each restart; without it DistributedSampler repeats the
+    same order every epoch.
+    """
+    epoch = 0
+    sampler = getattr(iterable, 'sampler', None)
+    if hasattr(sampler, 'set_epoch'):
+        sampler.set_epoch(epoch)
     iterator = iterable.__iter__()
     while True:
         try:
             yield iterator.__next__()
         except StopIteration:
+            epoch += 1
+            if hasattr(sampler, 'set_epoch'):
+                sampler.set_epoch(epoch)
             iterator = iterable.__iter__()
 
 
@@ -158,7 +171,6 @@ def get_dataloader(train_ds, val_ds, test_ds, config):
         raise ValueError(f"Model {config.model.name} not recognized.")
 
     is_ters = config.data.name == 'TERS'
-    # --- ADDED (stm): STM takes the same cube path as TERS, different collate --------------
     is_stm = config.data.name == 'STM'
 
     if is_stm:
@@ -189,23 +201,9 @@ def get_dataloader(train_ds, val_ds, test_ds, config):
             aug_translation_scale=config.data.aug_translation_scale
         )
 
-    # A TERS sample carries a whole image cube (256x256x100 float32 = 26.2 MB), not three
-    # 1-D spectra, so in-flight RAM is roughly
-    #     num_workers x prefetch_factor x batch_size x 26.2 MB
-    # This used to be hard-clamped to 2 workers on the assumption that RAM was scarce. It is
-    # not: a Roihu GH200 node gives ~211 GiB per reserved GPU, and measurement on gputest
-    # (job 923883) showed the loader -- not the GPU -- is the bottleneck. Throughput was flat
-    # at ~25 molecules/s from batch 16 to 256 while data-fetch time grew to 10x step time,
-    # i.e. the GPU sat idle waiting for cubes. So honour config.data.num_workers instead of
-    # overriding it, and keep prefetch_factor=1 so the formula above stays easy to reason
-    # about. Budget it before raising: at batch 64 and 16 workers this holds ~27 GiB.
+    # TERS cubes are 26 MB each (256x256x100 float32); prefetch_factor=1 bounds in-flight
+    # RAM to about num_workers x batch_size cubes.
     loader_kwargs = {}
-    # --- ADDED (stm): STM deliberately takes the `else` branch below ----------------------
-    # Not an oversight. The prefetch_factor=1 clamp above exists because a TERS cube is
-    # 256x256x100 float32 = 26.2 MB; an STM z-stack is 128x128x14 = 917 KB, 28x smaller, so
-    # at batch 128 / 8 workers / default prefetch 2 the in-flight cubes are ~1.9 GiB of the
-    # ~211 GiB a reserved GH200 gets. Clamping prefetch there would throttle the loader for
-    # no reason. STM still honours config.data.num_workers, because `else` reads it directly.
     if is_ters:
         num_workers = getattr(config.data, 'num_workers', 2)
         if num_workers > 0:
@@ -213,7 +211,17 @@ def get_dataloader(train_ds, val_ds, test_ds, config):
     else:
         num_workers = config.data.num_workers
 
-    train_loader = DataLoader(train_ds, batch_size=config.training.batch_size, shuffle=True,
+    # Under DDP, shard the training set across ranks; batch_size is then per rank.
+    train_sampler = None
+    if bool(getattr(config.training, 'ddp', False)):
+        from torch.utils.data.distributed import DistributedSampler
+        import distributed as _dist
+        train_sampler = DistributedSampler(
+            train_ds, num_replicas=_dist.get_world_size(), rank=_dist.get_rank(),
+            shuffle=True, drop_last=config.training.dataloader_drop_last)
+
+    train_loader = DataLoader(train_ds, batch_size=config.training.batch_size,
+                                shuffle=(train_sampler is None), sampler=train_sampler,
                                 num_workers=num_workers, collate_fn=collate_fn, drop_last=config.training.dataloader_drop_last, **loader_kwargs)
     val_loader = DataLoader(val_ds, batch_size=config.training.eval_batch_size, shuffle=False,
                                 num_workers=num_workers, collate_fn=collate_fn, **loader_kwargs)
@@ -592,26 +600,15 @@ class CollateSpectra(object):
 
 
 class CollateTers(CollateSpectra):
-    """TERS cube conditioning.  ADAPT of CollateSpectra by subclassing (docs/02-reuse-map.md 3).
-
-    Only the context differs: one dense ``(C, H, W)`` cube per molecule replaces the
-    uv/ir/raman triple, so the four-way ``spectra_version`` branch collapses to a single
-    stack.  ``pad_and_mask`` (lines 408-426) and ``augment_positions`` (lines 380-406) are
-    *inherited, not copied* -- they encode the mask conventions the whole pipeline depends
-    on (the diagonal exclusion, the ``reshape(-1, 1)``), and a divergent second copy is a
-    bug waiting to happen.
-    """
+    """Collate for TERS cube conditioning; ``context`` is the ``(B, C, H, W)`` cube batch."""
 
     def __init__(self, aug_rotation=False, aug_translation=False, aug_translation_scale=0.01):
-        # spectra_version is meaningless here; pin it so the inherited __init__ signature
-        # stays satisfied without the caller having to pass a dead argument.
+        # spectra_version does not apply to cubes
         super().__init__(spectra_version=None, aug_rotation=aug_rotation,
                          aug_translation=aug_translation,
                          aug_translation_scale=aug_translation_scale)
 
-    # --- ADDED (stm): which attribute holds the cube -------------------------------------
-    # A class constant rather than a constructor argument: it is a property of the modality,
-    # not of a run, and get_dataloader picks the class already.
+    # Data attribute that holds the cube.
     cube_attr = 'ters'
 
     def __call__(self, items):
@@ -636,20 +633,10 @@ class CollateTers(CollateSpectra):
 
 
 class CollateStm(CollateTers):
-    """--- ADDED (stm): STM z-stack conditioning.
+    """Collate for STM z-stack conditioning; reads the cube from ``data.stm``.
 
-    Identical to ``CollateTers`` but for which attribute carries the cube, because the
-    contract downstream is identical: one dense ``(C, H, W)`` tensor per molecule stacked
-    into ``context``. Subclassed rather than copied for the same reason ``CollateTers``
-    subclasses ``CollateSpectra`` -- ``pad_and_mask`` and ``augment_positions`` encode the
-    mask conventions the whole pipeline depends on.
-
-    .. note::
-       ``aug_rotation`` must stay False for STM. The cube is a *constant-height* stack over
-       a fixed surface, so rotating the 3D coordinates without rotating the image stack
-       would break the correspondence the conditioning relies on. ``get_dataloader`` sets it
-       False for every DMT run, so this is a note rather than a guard -- but it is the first
-       thing to check if augmentation is ever turned on.
+    ``aug_rotation`` must stay False: rotating coordinates without the images breaks their
+    correspondence. Nothing here enforces it.
     """
 
     cube_attr = 'stm'

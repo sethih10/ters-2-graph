@@ -8,7 +8,7 @@ Usage
     python -m datasets.preprocess_ters --self-test
     python -m datasets.preprocess_ters --h5 .../train.h5 --inspect
     python -m datasets.preprocess_ters \\
-        --data-dir /scratch/phys/sin/sethih1/Multimodal_TERS/planar_hdf5_0.05 \\
+        --data-dir $DATA_ROOT/planar_hdf5_0.5 \\
         --out-dir datasets/ters --stats
     python -m datasets.preprocess_ters --h5 .../train.h5 \\
         --out datasets/ters/graphs_train.pt --stats

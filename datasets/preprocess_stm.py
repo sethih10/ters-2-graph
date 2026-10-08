@@ -1,4 +1,4 @@
-"""Build graph sidecars for the STM corpus at ``/scratch/project_2001912/stm-data``.
+"""Build graph sidecars for the STM corpus at ``$DATA_ROOT/stm-data``.
 
 Uses the bond inference and encoding of :mod:`datasets.preprocess_ters` with a ten-element
 type map. Each split group's ``xyz`` rows are ``(x, y, z, Z, partial_charge)``, zero-padded;
@@ -7,9 +7,9 @@ the partial charge is not a formal charge and is not used as ``fc``.
 Usage
 -----
     python -m datasets.preprocess_stm --self-test
-    python -m datasets.preprocess_stm --inspect /scratch/project_2001912/stm-data/val.h5
-    python -m datasets.preprocess_stm --census  /scratch/project_2001912/stm-data/train.h5
-    python -m datasets.preprocess_stm --data-dir /scratch/project_2001912/stm-data \\
+    python -m datasets.preprocess_stm --inspect $DATA_ROOT/stm-data/val.h5
+    python -m datasets.preprocess_stm --census  $DATA_ROOT/stm-data/train.h5
+    python -m datasets.preprocess_stm --data-dir $DATA_ROOT/stm-data \\
         --out-dir datasets/stm --stats
 """
 

@@ -6,8 +6,8 @@ normalises it with ``NormalizeStmCube`` and stores it as ``data.stm`` for ``Coll
 Usage
 -----
     python -m datasets.stm_dataset \\
-        --h5 /scratch/project_2001912/stm-data/val.h5 \\
-        --graphs /scratch/project_2001912/stm-graphs/graphs_val.pt
+        --h5 $DATA_ROOT/stm-data/val.h5 \\
+        --graphs $DATA_ROOT/stm-graphs/graphs_val.pt
 """
 
 import torch

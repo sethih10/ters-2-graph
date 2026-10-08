@@ -1,3 +1,8 @@
+"""Score the separate molecule-list files saved by main.py --mode eval.
+
+Adapted from AzureLeon1/DiffSpectra (eval_sampled_mols/base_metrics.py).
+Uses the upstream similarity scorer; paths and checkpoint selection are explicit.
+"""
 import os
 import pickle
 import logging
@@ -9,7 +14,7 @@ from tqdm import tqdm
 
 # add path
 import sys
-sys.path.append('/path/to/DiffSpectra')
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from compute_metrics import evaluate_jsonl_predictions
 
 
@@ -157,16 +162,18 @@ def compute_metrics_for_saved_mols(base_path, output_path):
         logging.error(f"Traceback: {traceback.format_exc()}")
 
 def main():
-    parser = argparse.ArgumentParser(description='Compute metrics for saved molecules')
-    parser.add_argument('--base_path', type=str, 
-                        default='./exp/allspectra_pretrained_specformer/eval',
-                        help='Path to the directory containing molecule pkl files')
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--samples-dir', required=True,
+                        help='checkpoint folder containing the three saved molecule lists')
+    parser.add_argument('--out', default=None,
+                        help='output directory (default: metrics_results inside --samples-dir)')
     args = parser.parse_args()
+    for name in ('complete_rdmols_2d.pkl', 'sample_rdmols_3d.pkl', 'groundtruth_rdmols.pkl'):
+        if not os.path.isfile(os.path.join(args.samples_dir, name)):
+            parser.error(f'missing {name} in {args.samples_dir}')
+    output = args.out or os.path.join(args.samples_dir, 'metrics_results')
+    compute_metrics_for_saved_mols(args.samples_dir, output)
 
-    saved_mols_path = args.base_path + '/molecules_ckpt_40'
-    output_path = args.base_path + '/metrics_results'
-    
-    compute_metrics_for_saved_mols(saved_mols_path, output_path)
 
 if __name__ == '__main__':
-    main() 
+    main()

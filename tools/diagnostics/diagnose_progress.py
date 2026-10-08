@@ -1,15 +1,13 @@
-"""Did the last 24000 steps learn anything, and where in the noise schedule?
+"""Compare checkpoint losses at fixed diffusion noise levels.
 
-The total training loss is an average over a random timestep t per sample, so it is
-dominated by the high-noise end where the loss floor is irreducible. A flat total loss can
-therefore hide real progress at low noise. This resolves that by holding t FIXED and
-comparing two checkpoints on identical noise.
+Prints the EMA model's loss at each t for every checkpoint on identical batches and noise draws,
+and the change from the earliest to the latest step.
 
-torch.rand is used exactly once in losses.get_sde_graph_loss_fn's loss_fn -- to draw t
-(losses.py:327). The noise itself comes from torch.randn via sample_*_noise. So patching
-torch.rand alone pins t and leaves everything else untouched.
+Usage
+-----
+    python -m tools.diagnostics.diagnose_progress --ckpts CKPT [CKPT ...] [--set KEY=VALUE]
 """
-import argparse, importlib.util, random
+import argparse, random
 import numpy as np
 import torch
 
@@ -19,12 +17,7 @@ from models import create_model
 import losses
 from utils import get_data_scaler
 from diffusion import NoiseScheduleVP
-
-
-def load_config(path):
-    spec = importlib.util.spec_from_file_location('cfg', path)
-    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-    return m.get_config()
+from config_utils import add_set_arg, load_config
 
 
 class FixedT:
@@ -48,9 +41,10 @@ def main():
     ap.add_argument('--config-qm9', default='configs/base_ters.py')
     ap.add_argument('--batches', type=int, default=2)
     ap.add_argument('--seeds', type=int, default=3)
+    add_set_arg(ap)
     args = ap.parse_args()
 
-    config = load_config(args.config); config.device = torch.device('cuda')
+    config = load_config(args.config, args.overrides); config.device = torch.device('cuda')
     cfg_q = load_config(args.config_qm9)
     _, _, val_ds, test_ds, _ = get_dataset(config)
     _, _, _, _, _ = get_dataset(cfg_q)
@@ -91,7 +85,7 @@ def main():
 
     steps = sorted(results)
     print('\n' + '=' * 78)
-    print('Loss at FIXED noise level, identical noise across checkpoints')
+    print('Loss at fixed noise level, identical noise across checkpoints')
     print('=' * 78)
     hdr = f"{'t':>6} {'alpha^2/sig^2':>14}" + ''.join(f"{'step '+str(s):>14}" for s in steps)
     if len(steps) >= 2:

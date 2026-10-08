@@ -1,14 +1,11 @@
-"""How much does the spectrum matter, AS A FUNCTION OF NOISE LEVEL?
+"""Matched versus shuffled-cube loss at fixed noise levels.
 
-tools/diagnose_conditioning.py showed that shuffling the cubes costs +10.5% of the loss.
-But that number is averaged over a uniformly drawn t, and tools/diagnose_progress.py showed
-that such an average is ~95% high-noise timesteps where nothing is recoverable. So the
-t-averaged +10.5% under-measures the conditioning for exactly the same reason the training
-curve under-measures learning.
+Prints, for each t, both losses of the EMA model on the same batches and seeds, their difference
+and the paired t statistic.
 
-This pins t and re-runs the matched/shuffled comparison at each noise level.
-
-REUSE: FixedT and the loader/checkpoint setup from tools/diagnose_progress.py.
+Usage
+-----
+    python -m tools.diagnostics.diagnose_cond_by_t --ckpt CKPT [--set KEY=VALUE]
 """
 import argparse, importlib.util, random
 import numpy as np
@@ -20,7 +17,8 @@ from models import create_model
 import losses
 from utils import get_data_scaler
 from diffusion import NoiseScheduleVP
-from tools.diagnose_progress import FixedT, load_config
+from config_utils import add_set_arg, load_config
+from tools.diagnostics.diagnose_progress import FixedT
 
 
 def main():
@@ -30,9 +28,10 @@ def main():
     ap.add_argument('--config-qm9', default='configs/base_ters.py')
     ap.add_argument('--batches', type=int, default=2)
     ap.add_argument('--seeds', type=int, default=4)
+    add_set_arg(ap)
     args = ap.parse_args()
 
-    config = load_config(args.config); config.device = torch.device('cuda')
+    config = load_config(args.config, args.overrides); config.device = torch.device('cuda')
     cfg_q = load_config(args.config_qm9)
     _, _, val_ds, test_ds, _ = get_dataset(config)
     get_dataset(cfg_q)
@@ -56,7 +55,7 @@ def main():
 
     t_grid = [0.05, 0.15, 0.30, 0.50, 0.70, 0.90]
     print('\n' + '=' * 82)
-    print('Cost of handing the model the WRONG spectrum, by noise level')
+    print('Loss penalty for a mismatched cube, by noise level')
     print('=' * 82)
     print(f"{'t':>6}{'matched':>12}{'shuffled':>12}{'penalty':>12}{'% of loss':>12}{'paired t':>11}")
     for tv in t_grid:

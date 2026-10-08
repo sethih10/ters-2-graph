@@ -1,50 +1,13 @@
-"""Corpus-level analysis of the STM dataset: composition, size, bonds, rings, geometry, cubes.
+"""Per-split analysis of the STM corpus.
 
-What this answers, per split and across splits: *what is actually in this dataset?* -- the
-element histogram, the molecule-size distribution, bond orders and bond symbols, ring
-counts, formal charges, molecular weight, out-of-plane thickness, the cube intensity
-envelope, and whether the splits leak into each other.
-
-Provenance (ladder in docs/README.md):
-  * ``STM_TYPES`` / ``STM_SYMBOLS``, ``census``, ``iter_molecules``, ``atom_fc_census``
-                            -- **REUSE**, imported from datasets/preprocess_stm.py. The
-        element map in particular must never be retyped here: datasets_config.py's
-        ``atom_decoder`` and ``STM_TYPES`` already have to agree (a mismatch makes the
-        one-hot index and the element symbol disagree with no error anywhere), and a third
-        copy in an analysis script is a third place for that to drift.
-  * ``get_bond_symbol``     -- **REUSE**, imported from evaluation/cal_geometry.py, for the
-        same reason preprocess_stm.geometry_symbols imports it: a hand-written 'C1C' that
-        does not match what the metric emits describes a population the metric never scores.
-  * ``geometry_stats``      -- **REUSE**, but not re-run: ``preprocess_stm --stats`` already
-        wrote its output to ``<sidecar>.stats.json`` at build time, so this reads that file
-        and copies it into the report under ``preprocess_stats`` rather than recomputing an
-        O(n^2)-per-molecule pass whose answer is already on disk. Those are the numbers the
-        config's ``pos_norm`` / ``spatial_cut_off`` came from, so having them in the same
-        report is the point.
-  * per-molecule table, split leakage check, cube statistics, the figures -- **NEW**.
-        Nothing in the repo produces a per-molecule table or compares splits; ``census``
-        counts elements and sizes over the *raw* file, which is a different population
-        (it does not know which molecules survived encoding) and has no figures.
-
-One pass, many measurements (docs/06-code-practices.md 9): the sidecar costs ~90 s to load
-for the train split, so ``molecule_table`` computes every per-molecule quantity in a single
-loop rather than each figure re-walking the records.
+Reports composition, size, geometry and SMARTERS planarity, formal charges, image cube
+statistics and split overlap. Writes ``analysis.json``, per-record, per-CID and summary CSVs,
+and figures.
 
 Usage
 -----
-    python3 tools/analyze_stm.py --self-test          # no data required
-    python3 tools/analyze_stm.py                      # all three splits, default paths
-    python3 tools/analyze_stm.py --splits val --limit 2000
-    python3 tools/analyze_stm.py --no-cubes           # skip the HDF5 pass
-
-Environment: needs torch + rdkit + h5py + matplotlib. On the cluster:
-
-    module load python-pytorch/2.10
-    export PYTHONPATH="$HOME/.cache/ters-overlay:$PWD"
-    python3 tools/analyze_stm.py
-
-Writes ``analysis.json`` plus PNG figures under ``$TERS_EXP_ROOT/stm-eval/analysis``
-(never inside the repo -- $HOME is a 15 GB quota, see tools/paths.py).
+    python -m tools.analysis.analyze_stm
+    python -m tools.analysis.analyze_stm --self-test
 """
 
 import argparse
@@ -58,29 +21,16 @@ from collections import Counter
 
 import numpy as np
 
-# Both import forms, because tools here are run BOTH as `python3 tools/x.py` (sibling
-# import) and as `python3 -m tools.x` (package import). Mirrors tools/visualize_local.py.
-try:
-    from paths import under
-    from planarity import SMARTERS_THRESHOLDS, planarity_of
-except ImportError:
-    from tools.paths import under
-    from tools.planarity import SMARTERS_THRESHOLDS, planarity_of
+REPO = osp.dirname(osp.dirname(osp.dirname(osp.abspath(__file__))))
+sys.path.insert(0, REPO)
+from env import data_root, output_root
+from tools.analysis.planarity import SMARTERS_THRESHOLDS, planarity_of
 
-REPO = osp.dirname(osp.dirname(osp.abspath(__file__)))
-
-DATA_DIR = '/scratch/project_2001912/stm-data'
-GRAPHS_DIR = '/scratch/project_2001912/stm-graphs'
 SPLITS = ('train', 'val', 'test')
 
-# --- palette --------------------------------------------------------------------------
-# Categorical slots 1-3 of the validated default palette (blue / orange / aqua), which is
-# the set that clears the all-pairs colour-vision gates. Three splits, three slots -- and
-# the split identity is additionally carried by the legend and by direct labels, never by
-# colour alone.
 SPLIT_COLOR = {'train': '#2a78d6', 'val': '#eb6834', 'test': '#1baf7a'}
 SPLIT_DASH = {'train': '-', 'val': '--', 'test': ':'}
-# Single-series marks (element counts, size histograms) are one colour, not a cycled ramp.
+# Colour of single-series plots.
 ONE = '#2a78d6'
 INK, MUTED = '#0b0b0b', '#52514e'
 
@@ -90,22 +40,10 @@ BOND_ORDER_NAME = {1: 'single', 2: 'double', 3: 'triple', 4: 'aromatic'}
 # --- importing the pipeline without importing the whole training stack -----------------
 
 def load_bypassing_init(package_dir, module, alias):
-    """Import ``<package_dir>/<module>.py`` WITHOUT running that package's ``__init__``.
+    """Import ``<package_dir>/<module>.py`` without running the package's ``__init__``.
 
-    Both packages this script needs pull heavy optional dependencies from their
-    ``__init__`` -- ``datasets/__init__.py`` imports ``torch_geometric``,
-    ``evaluation/__init__.py`` imports ``fcd_torch`` -- and neither is present in the
-    notebook's kernel (the ``im2g`` venv, which is what ``check.ipynb`` runs on). Neither
-    is needed to read an element map or format a bond symbol.
-
-    A synthetic parent package with ``__path__`` pointing at the real directory is what
-    makes this work rather than a plain by-path import: the modules use relative imports
-    (``from .preprocess_ters import``, ``from .mmd import``) which need a parent to
-    resolve against, but that parent's ``__init__`` is never executed.
-
-    This exists so the constants stay in ONE place. Copying ``STM_TYPES`` or a bond-symbol
-    format into an analysis script is the drift docs/06-code-practices.md 1 is about, and
-    the element map already has to agree with ``datasets_config.py``'s ``atom_decoder``.
+    The module is registered under a synthetic parent package ``alias`` so that its relative
+    imports resolve.
     """
     if alias not in sys.modules:
         pkg = types.ModuleType(alias)
@@ -127,44 +65,24 @@ def load_bypassing_init(package_dir, module, alias):
 
 
 def stm_preprocess():
-    """``datasets.preprocess_stm``, importable from a plain-Python kernel too.
-
-    Follows docs/06-code-practices.md 8: the optional dependency gets a fallback rather
-    than taking the module down with it.
-    """
+    """Return ``datasets.preprocess_stm``, importing it directly if ``datasets`` cannot load."""
     try:
         from datasets import preprocess_stm
         return preprocess_stm
     except Exception:
-        # Deliberately Exception, not ImportError. The failure this has to survive is not
-        # only "torch_geometric is absent" -- it is also "torch_geometric is installed but
-        # cannot load", which is what happens on a login node where torch_scatter's CUDA
-        # extension raises OSError with no GPU present. Both mean the same thing here (the
-        # training stack is unusable in this interpreter) and both have the same answer,
-        # so catching only ImportError would take the analysis down on a machine where it
-        # is perfectly able to run.
         return load_bypassing_init(osp.join(REPO, 'datasets'), 'preprocess_stm',
                                    '_stm_analysis_datasets')
 
 
 def bond_symbol_fn():
-    """``evaluation.cal_geometry.get_bond_symbol``, or ``None`` if it will not import.
-
-    Same fallback shape as above -- ``evaluation/__init__.py`` can pull heavier things --
-    but here the honest answer when it fails is to report no bond symbols rather than to
-    invent a string format, so the caller gets ``None`` and says so.
-    """
+    """Return ``evaluation.cal_geometry.get_bond_symbol``, or ``None`` if unavailable."""
     try:
         from evaluation.cal_geometry import get_bond_symbol
         return get_bond_symbol
     except Exception:
         pass
     try:
-        # cal_geometry.py opens with ``from tqdm import tqdm``, which the notebook kernel
-        # does not have. tqdm is imported on line 1 and then never referenced anywhere in
-        # that file (`grep -n tqdm evaluation/cal_geometry.py` is one line), so a
-        # pass-through shim changes nothing it does. Installed only when tqdm is genuinely
-        # absent, so a real tqdm is never shadowed.
+        # cal_geometry only imports tqdm; provide a no-op when it is unavailable.
         if 'tqdm' not in sys.modules:
             try:
                 import tqdm  # noqa: F401
@@ -182,16 +100,13 @@ def bond_symbol_fn():
 # --- the single pass -------------------------------------------------------------------
 
 def molecule_table(records, symbols, want_smiles=True, progress_every=25000):
-    """Every per-molecule quantity, in one loop over the sidecar.  NEW.
+    """Compute every per-molecule quantity in one pass over the sidecar records.
 
-    Returns ``(table, extras)``. ``table`` holds one numpy array per column, all of length
-    ``len(records)``; ``extras`` holds the Counters that are not per-molecule scalars.
-
-    Percentages and histograms are derived later, in ``summarize`` -- this function only
-    measures, so that adding a plot never means walking 184k RDKit molecules again.
+    Returns ``(table, extras)``: ``table`` maps each column name to an array of length
+    ``len(records)``; ``extras`` holds the remaining per-record lists and counters.
     """
     from rdkit import Chem, RDLogger
-    RDLogger.DisableLog('rdApp.*')          # mirrors datasets/qm9s_dataset.py:198
+    RDLogger.DisableLog('rdApp.*')
 
     get_bond_symbol = bond_symbol_fn()
     n = len(records)
@@ -205,21 +120,16 @@ def molecule_table(records, symbols, want_smiles=True, progress_every=25000):
         n_aromatic_rings=np.zeros(n, np.int32),
         max_ring_size=np.zeros(n, np.int32),
         mol_weight=np.zeros(n, np.float64),
-        # Geometry, all in Angstrom, on coordinates centred the way losses.py:463 centres
-        # them at train time -- so a radius here is the radius the model has to normalise.
+        # Geometry in Angstrom, on mean-centred coordinates.
         radius=np.zeros(n, np.float64),
         gyration=np.zeros(n, np.float64),
-        thickness=np.zeros(n, np.float64),        # extent along the thinnest axis
+        thickness=np.zeros(n, np.float64),        # extent along the thinnest principal axis
         z_extent=np.zeros(n, np.float64),         # extent along the file's own z axis
-        # Planarity, exactly as SINGROUP/SMARTERS defines it -- see tools/planarity.py.
-        # NaN (not 0) where it is undefined, so molecules with <3 atoms stay out of the
-        # percentiles instead of piling onto the "perfectly planar" end.
+        # SMARTERS planarity; NaN for fewer than 3 atoms.
         plane_rmsd=np.full(n, np.nan),            # A, RMS distance from the best-fit plane
         planarity_pca=np.full(n, np.nan),         # %
         planarity_rms=np.full(n, np.nan),         # %
-        # ...and again over heavy atoms only. The two disagree materially (MEASURED on val:
-        # median 0.718 A all-atom vs 0.483 A heavy-only), and which one a given SMARTERS
-        # dataset was filtered on is not something to guess, so both are reported.
+        # The same metrics over heavy atoms only.
         plane_rmsd_heavy=np.full(n, np.nan),
         planarity_pca_heavy=np.full(n, np.nan),
         planarity_rms_heavy=np.full(n, np.nan),
@@ -232,8 +142,6 @@ def molecule_table(records, symbols, want_smiles=True, progress_every=25000):
     bond_symbols, formulas, fc_states = Counter(), Counter(), Counter()
     bond_lengths_by_order = {o: [] for o in (1, 2, 3, 4)}
     smiles, cids, sanitize_failures = [], [], 0
-    # Per-row, not just aggregated: the CSV needs one value per record, and re-deriving
-    # them later would mean a second walk over every RDKit molecule.
     formula_per_row, h5_index = [], np.zeros(n, np.int64)
 
     for i, r in enumerate(records):
@@ -266,15 +174,10 @@ def molecule_table(records, symbols, want_smiles=True, progress_every=25000):
         col['gyration'][i] = float(np.sqrt((d ** 2).mean()))
         col['z_extent'][i] = float(centred[:, 2].max() - centred[:, 2].min())
         if len(pos) >= 3:
-            # Thinnest principal axis. STM images a molecule adsorbed on a surface, so how
-            # flat it is -- and whether "flat" means the file's z axis specifically -- is a
-            # property worth measuring rather than assuming.
             _, _, vh = np.linalg.svd(centred, full_matrices=False)
             off = centred @ vh[-1]
             col['thickness'][i] = float(off.max() - off.min())
 
-        # Planarity the SMARTERS way. REUSE: tools/planarity.py is the single
-        # implementation, shared with tools/visualize_geometry.py.
         pc, pr, rm = planarity_of(pos)
         col['planarity_pca'][i], col['planarity_rms'][i], col['plane_rmsd'][i] = pc, pr, rm
         heavy = pos[z != 1]
@@ -283,9 +186,7 @@ def molecule_table(records, symbols, want_smiles=True, progress_every=25000):
          col['plane_rmsd_heavy'][i]) = pc, pr, rm
 
         # --- bonds ------------------------------------------------------------------
-        # Read off the encoded edges, not off RDKit again: edge_index/edge_type are what
-        # the model is trained against, so they are the population to describe. Both
-        # directions are stored (preprocess_ters.encode_graph:218), hence the // 2.
+        # encode_graph stores each bond in both directions, hence the // 2.
         et = r['edge_type'].numpy()
         ei = r['edge_index'].numpy()
         col['n_bonds'][i] = len(et) // 2
@@ -322,9 +223,7 @@ def molecule_table(records, symbols, want_smiles=True, progress_every=25000):
         except Exception:
             formula_per_row.append(None)
 
-        # Aromaticity and canonical SMILES both need a sanitized copy: the sidecar stores
-        # KEKULIZED molecules (preprocess_ters.mol_from_geometry), so aromatic flags are
-        # cleared and `n_aromatic_rings` read off the stored mol would be 0 everywhere.
+        # The sidecar molecules are kekulized; sanitize a copy to recover aromaticity.
         if want_smiles:
             try:
                 m = Chem.Mol(mol)
@@ -338,8 +237,7 @@ def molecule_table(records, symbols, want_smiles=True, progress_every=25000):
                 sanitize_failures += 1
                 smiles.append(None)
         else:
-            # Keep the list one entry per record even when SMILES are skipped, so the CSV
-            # writer and the leakage check can index it positionally without a guard.
+            # Keep one entry per record.
             smiles.append(None)
 
     extras = dict(
@@ -360,14 +258,7 @@ def molecule_table(records, symbols, want_smiles=True, progress_every=25000):
 
 
 def _pct(a, qs=(0, 1, 5, 25, 50, 75, 95, 99, 100)):
-    """Percentiles, ignoring NaN.
-
-    NaN-aware on purpose: the planarity columns are NaN where the quantity is undefined
-    (fewer than 3 atoms). ``np.percentile`` would propagate that to every percentile and
-    silently turn the whole block into NaN, which reads as a code failure rather than as
-    "4 records in 23067 have no plane". ``n`` is reported so a mostly-NaN column is
-    visible rather than merely smaller.
-    """
+    """Percentiles, mean, std and count of the finite values; ``{}`` if there are none."""
     a = np.asarray(a, dtype=np.float64)
     a = a[np.isfinite(a)]
     if a.size == 0:
@@ -384,7 +275,7 @@ def _threshold_table(values, thresholds):
 
 
 def summarize(col, extras, symbols, thresholds=SMARTERS_THRESHOLDS):
-    """Turn the per-molecule table into the JSON report.  NEW."""
+    """Turn the per-molecule table into the JSON report."""
     n = len(col['n_atoms'])
     elem_counts = extras['elem_counts']
     total_atoms = int(elem_counts.sum())
@@ -395,9 +286,6 @@ def summarize(col, extras, symbols, thresholds=SMARTERS_THRESHOLDS):
         per_element[sym] = dict(
             atoms=c,
             atom_fraction=c / total_atoms if total_atoms else 0.0,
-            # The second number is the one an element histogram alone hides: Si is 0.08 %
-            # of atoms, but the question "how many molecules would I lose by dropping Si?"
-            # is answered by the molecule fraction, not the atom fraction.
             molecules=int((elem_counts[:, j] > 0).sum()),
             molecule_fraction=float((elem_counts[:, j] > 0).mean()),
         )
@@ -408,11 +296,7 @@ def summarize(col, extras, symbols, thresholds=SMARTERS_THRESHOLDS):
     n_bond_total = sum(bonds_by_order.values())
 
     smiles = [s for s in extras['smiles'] if s]
-    # MEASURED, and the single most consequential fact about this corpus: a record is an
-    # IMAGE, not a molecule. The same PubChem CID appears up to 7 times in the val split
-    # (different orientations of the same molecule), so 2000 records carry only 1364
-    # distinct molecules. Every "n molecules" number elsewhere is really a record count,
-    # and the split-disjointness question has to be asked per CID, not per record.
+    # A record is one image; a CID can recur in several orientations.
     cids = [c for c in extras['cids'] if c]
     cid_mult = Counter(Counter(cids).values())
     out = dict(
@@ -462,16 +346,10 @@ def summarize(col, extras, symbols, thresholds=SMARTERS_THRESHOLDS):
             radius_of_gyration=_pct(col['gyration']),
             thinnest_axis_extent=_pct(col['thickness']),
             file_z_extent=_pct(col['z_extent']),
-            # If the corpus were adsorbed flat in the file's own frame, these two would
-            # agree. They are reported side by side so nobody has to assume it.
             flat_in_file_z_frame=bool(
                 np.median(col['z_extent']) <= 1.05 * np.median(col['thickness']))
             if n else None,
         ),
-        # Planarity as SINGROUP/SMARTERS defines it (tools/planarity.py). Reported for all
-        # atoms and for heavy atoms only, with the pass rate against SMARTERS' own dataset
-        # ladder -- which is the number that says whether this corpus would have qualified
-        # for one of its variants.
         planarity=dict(
             all_atoms=dict(
                 plane_rmsd=_pct(col['plane_rmsd']),
@@ -511,11 +389,10 @@ def summarize(col, extras, symbols, thresholds=SMARTERS_THRESHOLDS):
 
 
 def split_overlap(per_split):
-    """CID and canonical-SMILES overlap between splits.  NEW.
+    """CID and canonical-SMILES overlap between splits, with a severity verdict.
 
-    The one check that invalidates every number downstream if it fails. CIDs are the
-    dataset's own identifier; SMILES is the stronger test, because two PubChem CIDs can be
-    the same molecule.
+    A shared CID is leakage; a shared SMILES under distinct CIDs is reported as structure
+    overlap.
     """
     names = list(per_split)
     out = {'pairs': {}}
@@ -532,25 +409,13 @@ def split_overlap(per_split):
                 shared_smiles=n_smi,
                 shared_smiles_fraction_of_smaller=n_smi / max(1, min(len(sa), len(sb))),
             )
-    # Two different findings, and collapsing them into one "leakage" verdict is wrong.
-    #
-    #   shared CID    -- the same dataset entry is in two splits. The split was built on the
-    #                    wrong unit, and held-out numbers are not held out. Serious.
-    #   shared SMILES -- CID-disjoint, but two DIFFERENT PubChem entries turn out to be the
-    #                    same molecular graph once the geometry is encoded (stereochemistry
-    #                    and conformers do not survive that). A caveat on exact-match
-    #                    metrics, not a broken split.
-    #
-    # MEASURED on the full corpus: shared CIDs are 0 for all three pairs, shared SMILES are
-    # 44 / 59 / 5, i.e. ~1 % of the smaller split. Reporting that as "LEAKAGE" would raise a
-    # false alarm about a split that is in fact correctly constructed.
     cid_leaks = [k for k, v in out['pairs'].items() if v['shared_cids'] > 0]
     smiles_leaks = [k for k, v in out['pairs'].items() if v['shared_smiles'] > 0]
     worst = max((v['shared_smiles_fraction_of_smaller']
                  for v in out['pairs'].values()), default=0.0)
     if cid_leaks:
         out['severity'] = 'cid_leakage'
-        out['verdict'] = (f'CID LEAKAGE: the same dataset entry appears in both splits of '
+        out['verdict'] = (f'CID leakage: the same dataset entry appears in both splits of '
                           f'{", ".join(cid_leaks)}')
     elif smiles_leaks:
         out['severity'] = 'structure_overlap'
@@ -565,13 +430,10 @@ def split_overlap(per_split):
 
 
 def cube_stats(h5_path, split=None, n_sample=256, seed=0):
-    """Intensity statistics of the image cubes, on a random sample.  NEW.
+    """Intensity statistics of the image cubes on a random sample of ``n_sample`` molecules.
 
-    Sampled, not exhaustive: ``train.h5`` is 41 GB and the per-slice envelope converges
-    long before that. Reported in RECOVERED units -- the file stores ``uint16`` and the
-    group attribute says ``X.astype(float32) * scale[i]`` -- as well as raw, because the
-    per-sample scale spans orders of magnitude and a histogram of the raw integers
-    describes the encoding rather than the physics.
+    Reported on the stored ``uint16`` values and in recovered units,
+    ``X.astype(float32) * scale[i]``.
     """
     import h5py
 
@@ -609,15 +471,12 @@ def cube_stats(h5_path, split=None, n_sample=256, seed=0):
         per_slice_mean=env.tolist(),
         per_slice_mean_std=per_slice_mean.std(axis=0).tolist(),
         per_slice_std=per_slice_std.mean(axis=0).tolist(),
-        # The property models/stm_encoder.py's NormalizeStmCube exists to preserve: the
-        # signal decays with tip height. Checked here on the raw corpus, not assumed.
         envelope_monotone_decreasing=bool(np.all(env[:-1] > env[1:])),
         envelope_ratio_first_to_last=float(env[0] / env[-1]) if env[-1] else None,
         raw_uint16=_pct(raw_all),
         fraction_exactly_zero=float(frac_zero.mean()),
         scale=_pct(scale) if scale is not None else None,
-        # A dead slice would break the encoder the way dead channels break TERS; measured
-        # rather than inherited from the TERS numbers, which do not transfer.
+        # (cube, slice) pairs with zero spatial variance.
         n_dead_slices=int((per_slice_std < 1e-12).sum()),
     )
 
@@ -654,9 +513,6 @@ def fig_composition(col, extras, summary, symbols, split, out_path):
                  fontsize=12, fontweight='bold', x=.008, ha='left', color=INK)
 
     syms = symbols['symbol_list']
-    # A. atom counts per element. One series, so one colour and no legend; the title names
-    #    it. Log y because H:Si spans four orders of magnitude and a linear axis would
-    #    render six of the ten elements as an invisible line.
     ax = _style(axes[0, 0], 'A - Atoms per element', ylabel='atoms (log)')
     counts = [summary['elements'][s]['atoms'] for s in syms]
     ax.bar(syms, counts, color=ONE, width=.68)
@@ -666,8 +522,6 @@ def fig_composition(col, extras, summary, symbols, split, out_path):
                 ha='center', fontsize=7, color=MUTED)
     ax.set_ylim(top=max(counts) * 6)
 
-    # B. the same elements by MOLECULE, which is the number that decides what dropping an
-    #    element would cost.
     ax = _style(axes[0, 1], 'B - Molecules containing each element',
                 ylabel='% of molecules')
     fr = [100 * summary['elements'][s]['molecule_fraction'] for s in syms]
@@ -676,7 +530,7 @@ def fig_composition(col, extras, summary, symbols, split, out_path):
         ax.text(x, v + max(fr) * .02, f'{v:.3g}', ha='center', fontsize=7, color=MUTED)
     ax.set_ylim(0, max(fr) * 1.16)
 
-    # C. bond orders. 'aromatic' should be empty: the sidecar is kekulized.
+    # 'aromatic' is empty because the sidecar is kekulized.
     ax = _style(axes[0, 2], 'C - Bond orders', ylabel='bonds')
     names = list(BOND_ORDER_NAME.values())
     bvals = [summary['bonds']['by_order'][k] for k in names]
@@ -691,7 +545,6 @@ def fig_composition(col, extras, summary, symbols, split, out_path):
                 transform=ax.transAxes, ha='right', fontsize=7.5, style='italic',
                 color=MUTED)
 
-    # D. bond symbols, horizontally because the labels are long.
     ax = _style(axes[1, 0], 'D - Most common bonds', xlabel='count')
     top = summary['bonds']['top_symbols']
     if top:
@@ -702,7 +555,6 @@ def fig_composition(col, extras, summary, symbols, split, out_path):
         ax.text(.5, .5, 'evaluation.cal_geometry unavailable', transform=ax.transAxes,
                 ha='center', color=MUTED, fontsize=9)
 
-    # E. rings.
     ax = _style(axes[1, 1], 'E - Rings per molecule', xlabel='rings', ylabel='records')
     rh = summary['rings']['histogram']
     ks = sorted(rh)[:12]
@@ -713,7 +565,6 @@ def fig_composition(col, extras, summary, symbols, split, out_path):
             f'has aromatic ring {100 * summary["rings"]["fraction_with_aromatic_ring"]:.1f}%',
             transform=ax.transAxes, ha='right', va='top', fontsize=8, color=MUTED)
 
-    # F. formal charges -- the atom_fc_num population that check_2D_stability reads.
     ax = _style(axes[1, 2], 'F - Formal charge states', ylabel='atoms (log)')
     st = summary['formal_charges']['states']
     if st:
@@ -721,7 +572,7 @@ def fig_composition(col, extras, summary, symbols, split, out_path):
         vals = [v for _, v in items]
         ax.bar([k for k, _ in items], vals, color=ONE, width=.68)
         ax.set_yscale('log')
-        ax.set_ylim(top=max(vals) * 4)          # headroom, so the note clears the bars
+        ax.set_ylim(top=max(vals) * 4)
         ax.tick_params(axis='x', rotation=45)
     else:
         ax.text(.5, .5, 'no non-zero formal charges', transform=ax.transAxes,
@@ -754,9 +605,6 @@ def fig_size_shape(col, extras, summary, split, out_path):
         ax.hist(data, bins=bins, color=ONE, edgecolor='white', linewidth=.4)
         med = float(np.median(data))
         ax.axvline(med, color=INK, lw=1.2, ls='--')
-        # Anchored in axes fraction at mid-height, not at 95% of the data maximum: the
-        # note below sits top-right, and at the top these two collide whenever the median
-        # falls in the right half of the axis (checked with a text-overlap pass, not by eye).
         ax.text(med, .52, f'  median {med:.6g}', fontsize=7.5, color=INK, va='center',
                 transform=ax.get_xaxis_transform())
         if note:
@@ -777,9 +625,6 @@ def fig_size_shape(col, extras, summary, split, out_path):
          'max |r| from centroid (A)',
          'the quantity data.pos_norm\nhas to normalise')
 
-    # F. flatness. Two distributions on one axis, so: two colours, a legend, and both
-    #    direct-labelled. They answer different questions and the gap between them is the
-    #    point, which is why they share an axis rather than being two panels.
     ax = _style(axes[1, 1], 'F - Out-of-plane extent', 'A', 'records')
     bins = np.linspace(0, max(1e-6, float(np.percentile(col['z_extent'], 99.5))), 60)
     ax.hist(col['thickness'], bins=bins, color=SPLIT_COLOR['train'], alpha=.72,
@@ -790,14 +635,11 @@ def fig_size_shape(col, extras, summary, split, out_path):
     ax.text(.97, .60,
             f'median {np.median(col["thickness"]):.2f} A vs '
             f'{np.median(col["z_extent"]):.2f} A\n'
-            + ('the corpus is NOT stored\nflat in the z frame'
+            + ('the corpus is not stored\nflat in the z frame'
                if not summary['geometry']['flat_in_file_z_frame']
                else 'molecules lie flat in the\nfile z frame'),
             transform=ax.transAxes, ha='right', va='top', fontsize=7.5, color=MUTED)
 
-    # G. the SMARTERS number itself, against the ladder its dataset variants are named
-    #    for. All-atom vs heavy-only, because the two disagree by ~0.25 A at the median and
-    #    a pass rate quoted without saying which one is meaningless.
     pl = summary['planarity']
     ax = _style(axes[1, 2], 'G - Planarity RMSD (SMARTERS)',
                 'RMS distance from the best-fit plane (A)', 'records')
@@ -809,17 +651,11 @@ def fig_size_shape(col, extras, summary, split, out_path):
     ax.hist(col['plane_rmsd_heavy'][np.isfinite(col['plane_rmsd_heavy'])], bins=bins,
             color=SPLIT_COLOR['val'], alpha=.62, label='heavy atoms only',
             edgecolor='white', linewidth=.3)
-    # Staggered, because the SMARTERS ladder is 0.05 / 0.1 / 0.5 -- the first two are only
-    # 0.05 A apart on a ~1.2 A axis and their labels sit on top of each other at one height.
     for k, t in enumerate(pl['thresholds_angstrom']):
         if t <= hi:
             ax.axvline(t, color=INK, lw=1.0, ls=':')
             ax.text(t, .97 - .07 * k, f' {t:g}', fontsize=7, color=INK, va='top',
                     transform=ax.get_xaxis_transform())
-    # Legend upper-right and the numbers well below it: at 'center right' the two sat on
-    # top of each other. The text-overlap pass that was supposed to catch this compared
-    # Text artists to each other and ignored legends, so it reported a clean layout -- the
-    # checker now includes legend boxes.
     ax.legend(fontsize=7.5, frameon=False, labelcolor=MUTED, loc='upper right')
     frac = pl['all_atoms']['fraction_under_threshold']
     frac_h = pl['heavy_atoms']['fraction_under_threshold']
@@ -830,9 +666,6 @@ def fig_size_shape(col, extras, summary, split, out_path):
             transform=ax.transAxes, ha='right', va='top', fontsize=7, color=MUTED,
             family='monospace')
 
-    # H. the two normalised percentages. planarity_pca saturates near 100 and
-    #    planarity_rms does not -- showing them together is what makes that visible, and
-    #    it is the reason both are carried in the CSV rather than just one.
     ax = _style(axes[1, 3], 'H - Planarity (normalised)', 'percent', 'records')
     bins = np.linspace(
         float(min(np.nanpercentile(col['planarity_rms'], 0.5), 90.0)), 100.0, 60)
@@ -856,7 +689,7 @@ def fig_size_shape(col, extras, summary, split, out_path):
 
 
 def fig_splits(per_split, report, symbols, out_path):
-    """Do the splits look like the same distribution, and are they disjoint?"""
+    """Compare the splits' distributions and show their overlap."""
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -866,7 +699,6 @@ def fig_splits(per_split, report, symbols, out_path):
     fig.suptitle('STM splits compared', fontsize=12, fontweight='bold', x=.008,
                  ha='left', color=INK)
 
-    # A. size, as a density so the 8:1:1 split sizes do not decide the picture.
     ax = _style(axes[0, 0], 'A - Atoms per molecule', 'atoms', 'density')
     bins = np.arange(0, 56)
     for s in names:
@@ -875,7 +707,6 @@ def fig_splits(per_split, report, symbols, out_path):
                 color=SPLIT_COLOR[s], ls=SPLIT_DASH[s], label=f'{s}  (n={len(a):,})')
     ax.legend(fontsize=8, frameon=False, labelcolor=MUTED)
 
-    # B. element composition. Grouped bars, one group per element.
     ax = _style(axes[0, 1], 'B - Atom fraction per element', ylabel='% of atoms (log)')
     syms = symbols['symbol_list']
     x = np.arange(len(syms))
@@ -888,7 +719,6 @@ def fig_splits(per_split, report, symbols, out_path):
     ax.set_yscale('log')
     ax.legend(fontsize=8, frameon=False, ncol=3, labelcolor=MUTED)
 
-    # C. molecular weight.
     ax = _style(axes[1, 0], 'C - Molecular weight', 'g/mol', 'density')
     lo = min(per_split[s]['col']['mol_weight'].min() for s in names)
     hi = max(np.percentile(per_split[s]['col']['mol_weight'], 99.5) for s in names)
@@ -898,7 +728,6 @@ def fig_splits(per_split, report, symbols, out_path):
                 ls=SPLIT_DASH[s], label=s)
     ax.legend(fontsize=8, frameon=False, labelcolor=MUTED)
 
-    # D. the leakage verdict, as text -- a number that is 0 or not 0 is not a chart.
     ax = axes[1, 1]
     ax.axis('off')
     ax.set_title('D - Split overlap', fontsize=10, loc='left', fontweight='bold',
@@ -918,18 +747,15 @@ def fig_splits(per_split, report, symbols, out_path):
                      f'x {idt["records_per_cid"]:.2f} images each, '
                      f'{q["unique_smiles"]:,} unique SMILES')
     lines.append('')
-    lines.append('a record is an IMAGE, not a molecule:')
+    lines.append('a record is an image, not a molecule:')
     lines.append('the same CID recurs with a different orientation.')
-    # Status headline first, details under it. Previously the verdict sat at y=.015 and
-    # collided with the tail of this block, and its single long line ran off the right edge
-    # -- so it is wrapped here rather than trusted to fit.
     import textwrap
     sev = ov.get('severity', 'ok')
     headline = {
         'ok': 'PASS - no entry and no structure appears in two splits',
         'structure_overlap': 'PASS with a caveat - splits are CID-disjoint',
         'cid_leakage': 'FAIL - the same entry is in two splits; '
-                       'held-out numbers are not held out',
+                       'held-out metrics include training molecules',
     }.get(sev, 'not computed')
     detail = '\n'.join(textwrap.wrap(ov.get('verdict', ''), 62))
     ax.text(0, .99, headline, transform=ax.transAxes, va='top', fontsize=9.5,
@@ -948,7 +774,7 @@ def fig_splits(per_split, report, symbols, out_path):
 
 
 def fig_cubes(cubes, out_path):
-    """The conditioning signal itself: the z envelope, the intensities, the scales."""
+    """Plot the per-slice intensity envelope, raw intensity percentiles and recovery scales."""
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -971,7 +797,6 @@ def fig_cubes(cubes, out_path):
     ax.set_yscale('log')
     ax.legend(fontsize=8, frameon=False, labelcolor=MUTED, loc='upper right')
     c0 = cubes[names[0]]
-    # Bottom-left: the legend owns the top-right corner once there are three splits in it.
     ax.text(.03, .06,
             f'decays monotonically: {c0["envelope_monotone_decreasing"]}\n'
             f'first/last = {c0["envelope_ratio_first_to_last"]:.3g}x',
@@ -990,10 +815,6 @@ def fig_cubes(cubes, out_path):
             f'dead slices: {sum(cubes[s]["n_dead_slices"] for s in names)}',
             transform=ax.transAxes, va='top', fontsize=7.5, color=MUTED)
 
-    # A range plot, not three vertical lines: the medians coincide to the first decimal
-    # across splits, so axvlines drew three overlapping strokes in an otherwise empty panel
-    # and said nothing about the spread -- which is the interesting part here, since the
-    # per-sample scale ranges over orders of magnitude.
     ax = _style(axes[2], 'C - Per-sample recovery scale', 'scale (log10)', '')
     for k, sp in enumerate(names):
         sc = cubes[sp].get('scale')
@@ -1020,38 +841,19 @@ def fig_cubes(cubes, out_path):
     return out_path
 
 
-# --- CSV ---------------------------------------------------------------------------------
-# House style, copied from tools/parse_train_log.py:81-85: stdlib `csv.DictWriter`, a header
-# row always written, `newline=''` on the handle, numbers pre-rounded, missing values as the
-# empty string (never the text 'nan', which silently becomes a string column in pandas).
-#
-# NOT pandas, although the repo has it (compute_metrics.py:9, tools/paper_metrics.py:26):
-# pandas is absent from the `im2g` venv that runs stm_samples.ipynb, and this module is
-# imported from that notebook. A hard pandas dependency here would break the notebook on a
-# machine where the analysis otherwise runs fine.
+# --- CSV output ------------------------------------------------------------------------
 
-# Columns that are properties of the MOLECULE, so they must agree across every image of one
-# CID. All of these are rotation-invariant.
+# Rotation-invariant columns; checked for agreement across the records of a CID.
 _MOL_COLS = ('n_atoms', 'n_heavy', 'n_bonds', 'n_rings', 'n_aromatic_rings',
              'max_ring_size', 'mol_weight', 'radius', 'gyration',
              'plane_rmsd', 'planarity_pca', 'planarity_rms',
              'plane_rmsd_heavy', 'planarity_pca_heavy', 'planarity_rms_heavy',
              'thickness', 'n_fc')
 
-# Properties of the IMAGE, not of the molecule: dropped from the per-CID file, because
-# carrying the first record's value there would present an orientation-dependent number as
-# a molecular one.
-#
-# MEASURED, and the reason z_extent is on this list: across 977 val CIDs with more than one
-# record, the maximum within-CID spread is 1e-5..1e-4 for every rotation-invariant column
-# (last-digit rounding, nothing more) but **12.39 A** for z_extent. The repeats are rigid
-# rotations, and z_extent is measured along the FILE's z axis, which rotates with them.
-# `thickness` -- the extent along the molecule's OWN thinnest axis -- is invariant and stays.
+# Orientation-dependent columns, dropped from the per-CID CSV.
 _IMAGE_COLS = ('h5_index', 'z_extent')
 
-# Tolerance for the "do the repeats really agree?" check below. The CSV rounds to 4-5
-# decimals, so exact equality flags rounding noise as disagreement; 1e-3 sits far below any
-# real conformational difference and far above the rounding.
+# Within-CID agreement tolerance; must exceed the rounding in _ROUND.
 _AGREE_ATOL = 1e-3
 
 _ROUND = {'mol_weight': 4, 'radius': 4, 'gyration': 4, 'thickness': 4, 'z_extent': 4,
@@ -1074,7 +876,7 @@ def _cell(key, value):
 
 
 def _rows(col, extras, symbols, split):
-    """One dict per record, in the column order the CSV documents."""
+    """Yield one CSV row per record."""
     n = len(col['n_atoms'])
     elem = extras['elem_counts']
     order = extras['order_counts']
@@ -1102,23 +904,12 @@ def _rows(col, extras, symbols, split):
 
 
 def write_csvs(col, extras, symbols, split, out_dir):
-    """``molecules_<split>.csv`` (one row per image) and ``per_cid_<split>.csv``.
+    """Write ``molecules_<split>.csv`` (one row per image) and ``per_cid_<split>.csv``.
 
-    Why both (docs/06-code-practices.md 4 -- measure, do not assume): a record in this
-    corpus is an IMAGE, not a molecule. MEASURED over the full corpus: the same CID recurs
-    4.8 times on average and up to 37 times, and the repeats are RIGID ROTATIONS for
-    99.91 % of records -- their rotation-invariant columns agree to within rounding. The
-    remaining 0.09 % (165 of 184157 train records, worst spread 0.187 A) are genuinely
-    different geometries filed under one CID; they get a non-zero `geometry_spread` in the
-    per-CID file so they can be filtered out. So
-
-      * ``molecules_<split>.csv`` is the right file for anything image-level, and
-      * ``per_cid_<split>.csv`` is the right file for any molecular histogram, because the
-        per-record one is silently weighted by how many times each molecule was imaged.
-
-    ``n_records`` keeps the multiplicity and the first record supplies the values, which
-    is exact wherever the repeats really are rotations. The check is run on every pass
-    rather than trusted, because it is the assumption the whole per-CID file rests on.
+    Use the per-CID file for per-molecule statistics; the per-record file weights each molecule
+    by its number of images. The per-CID file keeps the first record's values, the count in
+    ``n_records`` and, in ``geometry_spread``, the largest within-CID disagreement on a
+    rotation-invariant column.
     """
     import csv
 
@@ -1133,13 +924,13 @@ def write_csvs(col, extras, symbols, split, out_dir):
     paths['per_record'] = per_record
 
     def _disagrees(a, b):
-        """True only for a difference bigger than the CSV's own rounding."""
+        """Difference beyond the CSV rounding tolerance: 0.0 within it, inf if non-numeric."""
         if a == b:
             return 0.0
         try:
             d = abs(float(a) - float(b))
         except (TypeError, ValueError):
-            return float('inf')          # a non-numeric mismatch, e.g. a different formula
+            return float('inf')
         return d if d > _AGREE_ATOL else 0.0
 
     by_cid, drift, worst = {}, 0, 0.0
@@ -1161,12 +952,6 @@ def write_csvs(col, extras, symbols, split, out_dir):
         out = {k: v for k, v in r.items()
                if k not in _IMAGE_COLS and k not in ('n_records', 'geometry_spread')}
         out['n_records'] = r['n_records']
-        # MEASURED: ~0.1 % of CIDs (165/38307 train records) carry records whose
-        # rotation-invariant columns genuinely differ -- same PubChem CID, different
-        # geometry, not just a different orientation. For those the row below is the FIRST
-        # record, not a summary of all of them. Carrying that per row rather than only in a
-        # log line means a reader filtering this file can exclude them without having to
-        # know the warning existed: `df[df.geometry_spread == 0]`.
         out['geometry_spread'] = round(float(r['geometry_spread']), 5) \
             if np.isfinite(r['geometry_spread']) else ''
         per_cid_rows.append(out)
@@ -1183,14 +968,14 @@ def write_csvs(col, extras, symbols, split, out_dir):
     paths['n_cid_drift_worst'] = worst
     if drift:
         print(f'  WARNING: {drift} records disagree with the first record of their own CID '
-              f'on a rotation-invariant column (worst spread {worst:.4g}). The repeats are '
-              f'not pure rotations after all, so per_cid_{split}.csv is a first-record '
-              f'sample, not a dedup.')
+              f'on a rotation-invariant column (worst spread {worst:.4g}), so the repeats are '
+              f'not pure rotations and per_cid_{split}.csv holds the first record of each CID, '
+              f'not values shared by all its records.')
     return paths
 
 
 def write_summary_csv(report, splits, out_dir):
-    """One row per split: the headline numbers, flat enough to paste into a table."""
+    """Write ``summary.csv``: one row of headline numbers per split."""
     import csv
 
     rows = []
@@ -1244,7 +1029,7 @@ def write_summary_csv(report, splits, out_dir):
 # --- driver -----------------------------------------------------------------------------
 
 def element_symbols():
-    """``{'symbol_list', 'symbol', 'index'}`` from the ONE element map.  REUSE."""
+    """Return ``{'symbol_list', 'symbol', 'index'}`` from the STM element map."""
     pp = stm_preprocess()
     return dict(symbol_list=list(pp.STM_SYMBOLS),
                 symbol={z: pp.STM_SYMBOLS[i] for z, i in pp.STM_TYPES.items()},
@@ -1264,9 +1049,6 @@ def analyze_split(graphs_path, symbols, limit=None, want_smiles=True,
     col, extras = molecule_table(records, symbols, want_smiles=want_smiles)
     summary = summarize(col, extras, symbols, thresholds=thresholds)
 
-    # REUSE: preprocess_stm --stats already measured the geometry rows and wrote them next
-    # to the sidecar. Reading beats recomputing, and it also lets the report say whether
-    # the sidecar it is describing is the one those config values came from.
     stats_path = graphs_path + '.stats.json'
     if osp.exists(stats_path):
         with open(stats_path) as fh:
@@ -1314,11 +1096,7 @@ def print_summary(name, s):
 
 
 def _benzene(plane='xy'):
-    """Planar benzene, in the xy plane or stood up in the xz plane.
-
-    Standing it up is the point: it is planar either way, so a flatness measure that reads
-    the file's z axis calls it 3.0 A thick while the true thickness is 0.
-    """
+    """Planar benzene as ``(z, pos)``, in the xy plane or stood up in the xz plane."""
     ang = np.arange(6) * np.pi / 3
     rc, rh = 1.39, 2.48
     xs = np.concatenate([rc * np.cos(ang), rh * np.cos(ang)])
@@ -1330,21 +1108,7 @@ def _benzene(plane='xy'):
 
 
 def self_test():
-    """Exercise every measurement on planted molecules.  No HDF5 and no sidecar needed.
-
-    Per docs/06-code-practices.md 3. Every planted case has an answer known by hand, so a
-    wrong answer is unambiguous rather than merely surprising:
-
-      [PLANTED] methane            -- 5 atoms, 1 heavy, 4 single bonds, 0 rings.
-      [PLANTED] benzene in xy      -- 1 ring of size 6, plane_rms 0, z_extent 0.
-      [PLANTED] benzene in xz      -- SAME molecule stood on edge: still plane_rms 0, but
-                                      z_extent ~2.8 A. Catches a flatness measure that
-                                      reads the file's z axis instead of the thinnest one.
-      [PLANTED] chloromethane      -- an element (Cl) the TERS four-element map lacks.
-      [PLANTED] a shared molecule  -- the leakage check must find it, and must not find one
-                                      in the disjoint pair.
-      [PLANTED] a decaying cube    -- the z envelope NormalizeStmCube exists to preserve.
-    """
+    """Check the measurements, CSVs and figures on planted molecules; needs no data."""
     import tempfile
 
     ok = failed = 0
@@ -1359,7 +1123,7 @@ def self_test():
 
     pp = stm_preprocess()
     symbols = element_symbols()
-    check('element map is the ten-element STM map, not a copy',
+    check('element map is the ten-element STM map',
           symbols['symbol_list'] == ['H', 'C', 'N', 'O', 'F', 'Si', 'P', 'S', 'Cl', 'Br'],
           str(symbols['symbol_list']))
 
@@ -1403,31 +1167,25 @@ def self_test():
           str(extras['order_counts'][2].tolist()))
     check('benzene: aromaticity recovered by sanitizing a copy (1 aromatic ring)',
           col['n_aromatic_rings'][2] == 1, str(col['n_aromatic_rings'][2]))
-    check('benzene in xy is flat by BOTH measures',
+    check('benzene in xy is flat by both measures',
           col['plane_rmsd'][2] < 1e-6 and col['z_extent'][2] < 1e-6,
           f'plane_rmsd {col["plane_rmsd"][2]:.2e}  z_extent {col["z_extent"][2]:.2e}')
-    check('benzene stood on edge: still flat, but NOT in the file z frame',
+    check('benzene stood on edge: still flat, but not in the file z frame',
           col['plane_rmsd'][3] < 1e-6 and col['z_extent'][3] > 2.5,
           f'plane_rmsd {col["plane_rmsd"][3]:.2e}  z_extent {col["z_extent"][3]:.2f}')
     check('SMARTERS percentages reach 100% on planar benzene',
           abs(col['planarity_pca'][2] - 100) < 1e-9
           and abs(col['planarity_rms'][2] - 100) < 1e-9,
           f'pca {col["planarity_pca"][2]:.4f}%  rms {col["planarity_rms"][2]:.4f}%')
-    # Methane is the non-planar control: 5 atoms, no plane can hold them.
     check('methane is measured as non-planar',
           col['plane_rmsd'][0] > 0.1 and col['planarity_rms'][0] < 90,
           f'rmsd {col["plane_rmsd"][0]:.3f} A  rms {col["planarity_rms"][0]:.1f}%')
-    # Heavy-atom planarity of benzene's ring is exact; the all-atom value includes the H
-    # shell, which for benzene is also planar -- so both must be 0 here.
+    # Methane has one heavy atom, so its heavy-atom planarity is NaN.
     check('heavy-atom planarity is computed alongside the all-atom one',
           abs(col['plane_rmsd_heavy'][2]) < 1e-6
-          and np.isnan(col['plane_rmsd_heavy'][0]),      # methane has 1 heavy atom
+          and np.isnan(col['plane_rmsd_heavy'][0]),
           f'benzene heavy {col["plane_rmsd_heavy"][2]:.2e}, '
           f'methane heavy {col["plane_rmsd_heavy"][0]}')
-    # The SMILES carry explicit [H], because the sidecar molecules do. That is the right
-    # behaviour for the leakage check and worth pinning: it makes the comparison STRICTER
-    # (two molecules that differ only in where an H sits are not merged), and it means the
-    # strings are not the H-suppressed SMILES a reader might expect to see.
     from rdkit import Chem
     check('the two benzenes are the same molecule to SMILES, with explicit H kept',
           (extras['smiles'][2] == extras['smiles'][3]
@@ -1447,8 +1205,6 @@ def self_test():
           and abs(s['elements']['Cl']['molecule_fraction'] - .25) < 1e-9)
     check('no bond is reported as aromatic (the sidecar is kekulized)',
           s['bonds']['by_order']['aromatic'] == 0)
-    # Regression: both fallback loaders silently degrade to "unavailable" if they break,
-    # and the only visible symptom is an empty panel D in a figure nobody re-reads.
     check('bond symbols come from evaluation/cal_geometry.py, not from a local format',
           s['bonds']['top_symbols'] is not None
           and s['bonds']['top_symbols'].get('H1C', 0) == 19,   # 4 + 3 + 6 + 6
@@ -1461,7 +1217,7 @@ def self_test():
           f'{s["identity"]["n_records"]} records / '
           f'{s["identity"]["n_unique_cids"]} CIDs')
 
-    # A shared CID is the serious finding and must outrank a shared structure.
+    # CID leakage must outrank structure overlap.
     ov = split_overlap({
         'a': dict(cids=['M1', 'C1'], smiles=['C', 'CCl']),
         'b': dict(cids=['B1'], smiles=['c1ccccc1']),
@@ -1470,11 +1226,8 @@ def self_test():
     check('a shared CID is graded as CID leakage',
           ov['pairs']['a|c']['shared_cids'] == 1 and ov['severity'] == 'cid_leakage',
           ov['verdict'])
-    check('overlap check does not invent one in the disjoint pair',
+    check('overlap check reports no shared structure for the disjoint pair',
           ov['pairs']['a|b']['shared_smiles'] == 0)
-    # CID-disjoint but the same molecule under two CIDs: a caveat, NOT a broken split.
-    # This is the real corpus's situation, and grading it 'cid_leakage' would be a false
-    # alarm about a split that is correctly constructed.
     ov2 = split_overlap({
         'a': dict(cids=['1'], smiles=['CCl']),
         'b': dict(cids=['2'], smiles=['CCl']),
@@ -1484,9 +1237,9 @@ def self_test():
           and ov2['pairs']['a|b']['shared_cids'] == 0, ov2['verdict'])
     ov3 = split_overlap({'a': dict(cids=['1'], smiles=['C']),
                          'b': dict(cids=['2'], smiles=['CCl'])})
-    check('genuinely disjoint splits are graded ok', ov3['severity'] == 'ok', ov3['verdict'])
+    check('fully disjoint splits are graded ok', ov3['severity'] == 'ok', ov3['verdict'])
 
-    check('planarity summary carries the SMARTERS threshold ladder',
+    check('planarity summary carries the SMARTERS thresholds',
           s['planarity']['thresholds_angstrom'] == list(SMARTERS_THRESHOLDS)
           and set(s['planarity']['all_atoms']['fraction_under_threshold']) ==
               {f'{t:g}' for t in SMARTERS_THRESHOLDS},
@@ -1518,11 +1271,6 @@ def self_test():
         check('per-CID CSV deduplicates and keeps the multiplicity',
               len(got_cid) == 4 and 'n_records' in got_cid[0]
               and 'h5_index' not in got_cid[0], f'{len(got_cid)} rows')
-        # z_extent is orientation-dependent (MEASURED: 12.39 A of within-CID spread on real
-        # data, against 1e-4 for every rotation-invariant column). Carrying the first
-        # record's value into the per-CID file would dress an image property up as a
-        # molecular one, so it is dropped -- and that is worth a regression test, because
-        # nothing else would notice.
         check('per-CID CSV drops orientation-dependent columns',
               'z_extent' not in got_cid[0] and 'z_extent' in got[0]
               and 'thickness' in got_cid[0],
@@ -1542,8 +1290,7 @@ def self_test():
         except ImportError:
             print('  SKIP  cube statistics (h5py not installed)')
         else:
-            # A synthetic corpus with a monotone z-decay envelope planted in it, small
-            # enough to build in memory: 4 molecules, 16x16 pixels, 6 slices.
+            # Synthetic HDF5 with a planted monotone z-decay envelope.
             n_z = 6
             env = np.exp(-np.arange(n_z) / 1.5)
             rng = np.random.default_rng(0)
@@ -1574,10 +1321,10 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--self-test', action='store_true', help='no data required')
-    ap.add_argument('--graphs-dir', default=GRAPHS_DIR, help='holds graphs_{split}.pt')
-    ap.add_argument('--data-dir', default=DATA_DIR, help='holds {split}.h5')
+    ap.add_argument('--graphs-dir', default=None, help='holds graphs_{split}.pt (default: DATA_ROOT/stm-graphs)')
+    ap.add_argument('--data-dir', default=None, help='holds {split}.h5 (default: DATA_ROOT/stm-data)')
     ap.add_argument('--out-dir', default=None,
-                    help='default: $TERS_EXP_ROOT/stm-eval/analysis')
+                    help='default: $OUTPUT_ROOT/stm-eval/analysis')
     ap.add_argument('--splits', nargs='+', default=list(SPLITS))
     ap.add_argument('--limit', type=int, default=None,
                     help='first N molecules per split (smoke runs)')
@@ -1591,7 +1338,7 @@ def main():
     ap.add_argument('--planarity-thresholds', type=float, nargs='+',
                     default=list(SMARTERS_THRESHOLDS),
                     help=f'RMSD cut-offs to report pass rates against, in Angstrom '
-                         f'(default: the SMARTERS ladder {list(SMARTERS_THRESHOLDS)})')
+                         f'(default: the SMARTERS thresholds {list(SMARTERS_THRESHOLDS)})')
     a = ap.parse_args()
 
     if a.self_test:
@@ -1599,7 +1346,9 @@ def main():
         print(f'\nself-test: {ok} passed, {failed} failed')
         raise SystemExit(1 if failed else 0)
 
-    out_dir = a.out_dir or under('stm-eval', 'analysis')
+    a.graphs_dir = a.graphs_dir or data_root('stm-graphs')
+    a.data_dir = a.data_dir or data_root('stm-data')
+    out_dir = a.out_dir or output_root('stm-eval', 'analysis')
     os.makedirs(out_dir, exist_ok=True)
     symbols = element_symbols()
     report, per_split, figures, csvs = {}, {}, [], []

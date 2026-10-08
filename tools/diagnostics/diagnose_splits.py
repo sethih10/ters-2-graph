@@ -1,9 +1,10 @@
-"""Run the conditioning tests on BOTH held-out splits.
+"""Matched vs shuffled-cube loss on the val and test splits at fixed noise levels.
 
-Everything reported so far came from the validation split only. The test split
-(782 molecules, verified disjoint from train and val) had never been touched. This
-runs the same paired matched/shuffled comparison at fixed noise on each, so val and
-test can be compared directly.
+Also prints the test loss relative to the val loss.
+
+Usage
+-----
+    python -m tools.diagnostics.diagnose_splits --ckpt CKPT [--set KEY=VALUE]
 """
 import argparse, random
 import numpy as np
@@ -15,7 +16,8 @@ from models import create_model
 import losses
 from utils import get_data_scaler
 from diffusion import NoiseScheduleVP
-from tools.diagnose_progress import FixedT, load_config
+from config_utils import add_set_arg, load_config
+from tools.diagnostics.diagnose_progress import FixedT
 
 
 def main():
@@ -25,9 +27,10 @@ def main():
     ap.add_argument('--config-qm9', default='configs/base_ters.py')
     ap.add_argument('--batches', type=int, default=2)
     ap.add_argument('--seeds', type=int, default=3)
+    add_set_arg(ap)
     args = ap.parse_args()
 
-    config = load_config(args.config); config.device = torch.device('cuda')
+    config = load_config(args.config, args.overrides); config.device = torch.device('cuda')
     cfg_q = load_config(args.config_qm9)
     _, _, val_ds, test_ds, _ = get_dataset(config)
     get_dataset(cfg_q)
@@ -47,7 +50,7 @@ def main():
     t_grid = [0.05, 0.15, 0.30, 0.50, 0.70, 0.90]
     table = {}
     for name, ds in (('val', val_ds), ('test', test_ds)):
-        # get_dataloader(train, val, test); we read the middle loader for whichever ds we pass.
+        # get_dataloader returns (train, val, test) loaders; only the middle one is used.
         _, loader, _ = get_dataloader(ds, ds, ds, config)
         it = iter(loader)
         batches = [next(it) for _ in range(args.batches)]
@@ -72,7 +75,7 @@ def main():
         table[name] = per_t
 
     print('\n' + '=' * 92)
-    print('Validation vs test: loss, and the cost of the WRONG spectrum, at fixed noise')
+    print('Validation vs test: loss and mismatched-cube penalty at fixed noise')
     print('=' * 92)
     print(f"{'t':>6}{'val loss':>11}{'test loss':>11}{'val pen':>10}{'test pen':>10}"
           f"{'val %':>9}{'test %':>9}{'gap':>9}")
@@ -81,8 +84,8 @@ def main():
         print(f'{tv:6.2f}{v[0]:11.4f}{te[0]:11.4f}{v[2]:+10.4f}{te[2]:+10.4f}'
               f'{100*v[2]/v[0]:+9.1f}{100*te[2]/te[0]:+9.1f}{100*(te[0]-v[0])/v[0]:+9.2f}')
     print('=' * 92)
-    print('gap = how much worse test is than val at that noise level; a large positive gap')
-    print('would be the overfitting signal the run has no validation loss to show.')
+    print('gap = test loss relative to val loss at that noise level, in %; a large positive')
+    print('gap indicates overfitting, which training does not report (it logs no validation loss).')
 
 
 if __name__ == '__main__':

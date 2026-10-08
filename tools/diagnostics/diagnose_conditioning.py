@@ -1,21 +1,13 @@
-"""Is the trained model actually using the TERS cube?
+"""Check whether a trained model uses the cube condition, without sampling molecules.
 
-The training loss went flat after ~4000 steps (job 925597). That is consistent with two
-very different stories:
-  (a) the model learned an unconditional prior over molecules and ignores the cube, or
-  (b) the model is conditioning fine and the total loss is dominated by the irreducible
-      high-noise timesteps, which hide real progress.
+Prints the spread of encoder outputs, the conditioning-to-time-embedding norm ratio, and the
+EMA model's loss with matched, shuffled and zeroed cubes.
 
-`sampling.py` has no TERS branch (D-8), so the usual answer -- generate molecules and score
-them -- is not available. These four tests distinguish (a) from (b) without a sampler.
-
-REUSE: get_dataset/get_dataloader (datasets/build_dataset.py), create_model (models/utils.py),
-       get_sde_graph_loss_fn + process_edge_batch (losses.py), NoiseScheduleVP, get_data_scaler.
-NEW:   only the shuffling and the paired-seed harness.
-
-Run on a GPU node:  python -m tools.diagnose_conditioning --ckpt <path> [--batches 5]
+Usage
+-----
+    python -m tools.diagnostics.diagnose_conditioning --ckpt CKPT [--set KEY=VALUE]
 """
-import argparse, importlib.util, random, sys
+import argparse, random, sys
 import numpy as np
 import torch
 
@@ -25,13 +17,7 @@ from models import create_model
 import losses
 from utils import get_data_scaler
 from diffusion import NoiseScheduleVP
-
-
-def load_config(path):
-    spec = importlib.util.spec_from_file_location('cfg', path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod.get_config()
+from config_utils import add_set_arg, load_config
 
 
 def unwrap(model):
@@ -45,16 +31,17 @@ def main():
     ap.add_argument('--config-qm9', default='configs/base_ters.py')
     ap.add_argument('--batches', type=int, default=5)
     ap.add_argument('--seeds', type=int, default=6)
+    add_set_arg(ap)
     args = ap.parse_args()
 
-    config = load_config(args.config)
+    config = load_config(args.config, args.overrides)
     config.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     cfg_qm9 = load_config(args.config_qm9)
 
     print(f'device: {config.device}')
     _, _, val_ds, test_ds, _ = get_dataset(config)
     _, _, val_o, test_o, _ = get_dataset(cfg_qm9)
-    # get_dataloader wants (train, val, test); the val split is what we want to read.
+    # get_dataloader takes (train, val, test); only the validation loader is used.
     _, val_loader, _ = get_dataloader(val_ds, val_ds, test_ds, config)
 
     model = create_model(config)
@@ -62,7 +49,7 @@ def main():
     ck = torch.load(args.ckpt, map_location=config.device, weights_only=False)
     model.load_state_dict(ck['model'], strict=True)
     ema.load_state_dict(ck['ema'])
-    ema.copy_to(model.parameters())          # evaluate the EMA weights, as --mode eval would
+    ema.copy_to(model.parameters())
     model.eval()
     print(f"loaded step {ck['step']} (EMA weights)")
 
@@ -84,14 +71,14 @@ def main():
 
     # ---------------------------------------------------------------- A: encoder collapse
     print('\n' + '=' * 72)
-    print('A. Does the TERS encoder produce a DIFFERENT vector per molecule?')
+    print('A. Does the TERS encoder produce a different vector per molecule?')
     print('=' * 72)
     embs = []
     with torch.no_grad():
         for b in batches:
             embs.append(net.cond_encoder(b['context'].to(config.device)).float().cpu())
-    E = torch.cat(embs)                                   # [N, 256]
-    across = E.std(dim=0)                                 # spread across molecules, per dim
+    E = torch.cat(embs)                                   # (N, nf)
+    across = E.std(dim=0)
     mag = E.abs().mean()
     print(f'  embeddings: {tuple(E.shape)}')
     print(f'  mean |activation|            : {mag:.6f}')
@@ -104,8 +91,8 @@ def main():
 
     # ---------------------------------------------------------------- B: signal magnitude
     print('\n' + '=' * 72)
-    print('B. How big is the cube signal next to the time embedding it is ADDED to?')
-    print('   (dmt.py:428  time_emb = time_mlp(noise_level) + context)')
+    print('B. How large is the cube signal relative to the time embedding it is added to?')
+    print('   (DMT.forward: time_emb = time_mlp(noise_level) + context)')
     print('=' * 72)
     with torch.no_grad():
         ctx = net.cond_lin(net.cond_encoder(batches[0]['context'].to(config.device)))
@@ -119,13 +106,13 @@ def main():
 
     # ------------------------------------------------- C: paired matched vs shuffled vs zero
     print('\n' + '=' * 72)
-    print('C. DECISIVE: same molecules, same t, same noise -- only the cube pairing changes.')
-    print('   If matched == shuffled, the cube is contributing nothing.')
+    print('C. Same molecules, t and noise; only the cube pairing changes.')
+    print('   If matched equals shuffled, the cube has no effect on the loss.')
     print('=' * 72)
     rows = []
     for bi, b in enumerate(batches):
         n = b['positions'].shape[0]
-        perm = torch.roll(torch.arange(n), 1)      # every molecule gets someone else's cube
+        perm = torch.roll(torch.arange(n), 1)      # no molecule keeps its own cube
         for sd in range(args.seeds):
             out = {}
             for name in ('matched', 'shuffled', 'zeroed'):
@@ -158,10 +145,10 @@ def main():
 
     print('\n' + '=' * 72)
     if abs(d.mean()) < 1e-4 or (d.std() > 0 and abs(d.mean() / (d.std(ddof=1) / np.sqrt(len(d)))) < 2):
-        print('VERDICT: giving the model the WRONG spectrum costs it nothing.')
-        print('         The cube is not being used. The model is an unconditional prior.')
+        print('Result: a mismatched cube does not change the loss.')
+        print('        The cube is not used; the model behaves as an unconditional prior.')
     else:
-        print('VERDICT: the wrong spectrum measurably hurts the loss -- conditioning IS active.')
+        print('Result: a mismatched cube measurably changes the loss; conditioning is active.')
     print('=' * 72)
 
 

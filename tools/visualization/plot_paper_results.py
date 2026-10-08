@@ -1,20 +1,11 @@
-"""The DiffSpectra-style results figure for TERS, with the null control the paper has no need of.
-
-The paper's headline is a top-k accuracy curve (top-1 40.76% -> top-10 99.49% on QM9S). That
-number is only interpretable because QM9S conditioning is a real spectrum of the target. Here the
-model is additionally handed the true atom count and the chemical space is one narrow family, so a
-matched-only curve would flatter the model. Every panel therefore carries the shuffled-cube null:
-same targets, same atom counts, another molecule's cube.
-
-REUSE : tools/paper_metrics.py for the scoring (upstream compute_metrics.py definitions).
-NEW   : the figure.
-"""
-import argparse, os, pickle
+"""Plot top-k recovery and target-similarity metrics for matched and shuffled-cube runs."""
+import argparse, os, pickle, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from tools.paper_metrics import pair_metrics, SIMS
+from eval_sampled_mols.paper_metrics import pair_metrics, SIMS
 
 MATCH_C, NULL_C = '#1B5E9B', '#B03030'
 
@@ -45,7 +36,6 @@ def main():
     fig = plt.figure(figsize=(13.5, 4.4), facecolor='white')
     gs = fig.add_gridspec(1, 3, width_ratios=[1, 1.15, 1.05], wspace=.32)
 
-    # --- A: top-k accuracy, the paper's headline plot ---------------------------------------
     ax = fig.add_subplot(gs[0, 0])
     ax.plot(ks, tk_m, 'o-', color=MATCH_C, lw=2, ms=5, label='matched cube', zorder=3)
     ax.plot(ks, tk_n, 's--', color=NULL_C, lw=2, ms=4, label='shuffled cube (null)', zorder=3)
@@ -59,7 +49,6 @@ def main():
     ax.annotate(f'DiffSpectra on QM9S: 0.9949 @ k=10', xy=(.5, .93), xycoords='axes fraction',
                 fontsize=7.5, color='#666', ha='center', style='italic')
 
-    # --- B: best-of-k similarity, matched vs null ------------------------------------------
     ax = fig.add_subplot(gs[0, 1])
     y = np.arange(len(SIMS))[::-1]
     mm = [best_m[m].mean() for m in SIMS]
@@ -76,7 +65,6 @@ def main():
     for s in ('top', 'right', 'left'):
         ax.spines[s].set_visible(False)
 
-    # --- C: per-target paired effect --------------------------------------------------------
     ax = fig.add_subplot(gs[0, 2])
     a, b = best_n['Tanimoto (Morgan)'], best_m['Tanimoto (Morgan)']
     order = np.argsort(b)

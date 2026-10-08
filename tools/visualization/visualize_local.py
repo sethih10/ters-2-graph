@@ -1,27 +1,10 @@
-"""Draw the generated molecules to PNG files on disk.
+"""Render each target next to its generated candidates, ordered by score.
 
-REUSE : rdkit.Chem.Draw.MolsToGridImage -- the same primitive visualize.py:29 uses.
-ADAPT : visualize.py:7-32. That helper lays molecules out as an undifferentiated grid
-        capped at config.sampling.vis_row * vis_col, with no legends, so it cannot show
-        which sample came from which spectrum or how good any of them is. Here each ROW is
-        one spectrum: column 0 is the ground truth, columns 1-5 are that spectrum's five
-        samples, and the legend carries the score. Rows run best to worst.
-        (Two bugs in that helper, left alone since this file does not modify it: `Chem` is
-        never imported, so check_valid=True raises NameError on a misspelled
-        `Chem.SantizeMol`; and the bare `except: pass` at line 31 hides every failure.)
-NEW   : the truth/sample pairing and the legend strings.
-
-Writes into <dir>/figures/ as PNG, with SVG alongside as a vector fallback.
+Writes one PNG and one SVG grid per split.
 """
-import argparse, os, pickle
+import argparse, os, pickle, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-# --- ADDED (stm): output paths resolve to /scratch, never inside the repo ($HOME is a
-# 15 GB quota and one run is 3.7 GB). Both import forms, because these are run BOTH as
-# `python3 tools/x.py` (sibling import) and as `python3 -m tools.x` (package import).
-try:
-    from paths import generated
-except ImportError:
-    from tools.paths import generated
 from rdkit import Chem, RDLogger
 from rdkit.Chem import Draw, AllChem
 from rdkit.Chem.Draw import rdMolDraw2D
@@ -58,7 +41,6 @@ def grid_for_split(rows, path_png, path_svg, sub=(380, 300)):
                 legends.append(f"sample {s['i']}  Tan {s['tanimoto']:.2f}{tag}")
     ncol = 1 + len(rows[0]['samples'])
 
-    # REUSE: identical call shape to visualize.py:29, plus legends and an explicit column count.
     img = Draw.MolsToGridImage(mols, molsPerRow=ncol, subImgSize=sub,
                                legends=legends, useSVG=False, returnPNG=False)
     with open(path_png, 'wb') as f:
@@ -75,7 +57,7 @@ def grid_for_split(rows, path_png, path_svg, sub=(380, 300)):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--dir', default=generated('ters-runs/ters_20260828_925597'))
+    ap.add_argument('--dir', required=True, help='a <workdir>/generated directory')
     ap.add_argument('--splits', nargs='+', default=['test', 'val'])
     args = ap.parse_args()
     figdir = os.path.join(args.dir, 'figures')

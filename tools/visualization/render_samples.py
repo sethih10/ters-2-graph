@@ -1,23 +1,11 @@
-"""Rescore the generated molecules honestly, and draw them.
+"""Rescore generated samples on heavy atoms (explicit hydrogens removed).
 
-tools/sample_ters.py fingerprinted molecules that still carry explicit hydrogens (the
-generator emits H as a real atom type, and the ground-truth sidecar stores them too).
-Morgan fingerprints treat every explicit H as its own atom environment, which is not how
-these similarities are normally reported and which depresses the score. This rescores on
-heavy atoms (Chem.RemoveHs) and adds two metrics that matter more for structure elucidation
-than Tanimoto does:
-  * molecular formula match -- did the spectrum at least pin the composition?
-  * heavy-atom canonical SMILES match -- did it find the actual molecule?
+Reports Morgan Tanimoto, formula match and canonical SMILES match per sample, and writes
+`rescored<tag>.json` and `summary<tag>.pkl` (the latter with SVG depictions).
 """
-import argparse, base64, io, json, os, pickle
+import argparse, base64, io, json, os, pickle, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-# --- ADDED (stm): output paths resolve to /scratch, never inside the repo ($HOME is a
-# 15 GB quota and one run is 3.7 GB). Both import forms, because these are run BOTH as
-# `python3 tools/x.py` (sibling import) and as `python3 -m tools.x` (package import).
-try:
-    from paths import generated
-except ImportError:
-    from tools.paths import generated
 import numpy as np
 from rdkit import Chem, RDLogger
 from rdkit.Chem import AllChem, Draw, DataStructs
@@ -61,12 +49,13 @@ def svg(mol, size=(260, 210), label=''):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--dir', default=generated('ters-runs/ters_20260828_925597'))
+    ap.add_argument('--dir', required=True, help='a <workdir>/generated directory')
     ap.add_argument('--splits', nargs='+', default=['test', 'val'])
     ap.add_argument('--tag', default='',
                     help="Suffix of the sample files to score, e.g. '_shuf' for the "
-                         "shuffled-cube null control written by sample_ters --shuffle-cubes. "
-                         "Outputs are suffixed to match so a null never overwrites a matched run.")
+                         "shuffled-cube null control written by sample.py --shuffle-cubes. "
+                         "Outputs get the same suffix, so a null-control run does not overwrite "
+                         "a matched run.")
     args = ap.parse_args()
 
     summary = {}
@@ -104,7 +93,7 @@ def main():
         rows.sort(key=lambda r: -r['best'])
         summary[split] = rows
 
-        print(f'\n{"="*94}\n{split.upper()} -- rescored on HEAVY ATOMS (explicit H removed)\n{"="*94}')
+        print(f'\n{"="*94}\n{split.upper()} -- rescored on heavy atoms (explicit H removed)\n{"="*94}')
         print(f"{'idx':>6}{'atoms':>7}{'valid':>8}{'formula':>9}{'exact':>7}{'best Tan':>10}{'mean Tan':>10}  formula")
         for r in rows:
             print(f"{r['ds_index']:>6}{r['n_atoms']:>7}{r['n_valid']:>5}/{len(r['samples'])}"

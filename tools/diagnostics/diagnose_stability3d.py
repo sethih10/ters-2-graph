@@ -1,19 +1,14 @@
-"""Why does Metric-3D report mol_stable ~0.17-0.25 even on molecules that are CORRECT?
+"""3D and 2D stability metrics on ground-truth STM test molecules.
 
-Runs `check_stability` -- the 3D metric -- over GROUND-TRUTH structures, which are right by
-construction, and splits the failures by the two suspected causes:
+Prints molecule- and atom-level stability from ``check_stability`` (3D) and
+``check_2D_stability`` (2D), grouped by element set and by whether any atom is charged.
 
-  (a) ELEMENTS. margin1/2/3 in evaluation/bond_analyze.py:119-120 were tuned to maximise the
-      stability of QM9 true samples, i.e. on H/C/N/O/F only. stm_10elem also has Si/P/S/Cl/Br.
-  (b) FORMAL CHARGE. check_stability scores against `allowed_bonds`, which is CHARGE-BLIND,
-      while stm_10elem['atom_fc_num'] records ~24k O-1, ~14k N1, ~13k S1. check_2D_stability
-      uses `allowed_fc_bonds` instead -- that is exactly the difference between the two.
-
-Reports per-atom and per-molecule stability inside each stratum, so the two causes are
-separated rather than asserted.
+Usage
+-----
+    python -m tools.diagnostics.diagnose_stability3d [-n N]
 """
 import argparse, importlib.util, os, sys, collections
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import torch
 from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
@@ -40,7 +35,7 @@ def main():
 
     n = min(a.n, len(test_ds))
     sel = torch.randperm(len(test_ds), generator=torch.Generator().manual_seed(a.seed))[:n].tolist()
-    print(f'{n} GROUND-TRUTH molecules from the test split (correct by construction)\n')
+    print(f'{n} ground-truth molecules from the test split (correct by construction)\n')
 
     strata = collections.defaultdict(lambda: dict(mols=0, stable=0, atoms=0, atoms_stable=0,
                                                   stable2d=0, atoms_stable2d=0))
@@ -82,9 +77,9 @@ def main():
     print(f'{"ALL":16s} {"":9s} {tot["mols"]:6d} '
           f'{tot["stable"]/tot["mols"]:8.4f} {tot["atoms_stable"]/tot["atoms"]:8.4f} '
           f'{tot["stable2d"]/tot["mols"]:8.4f} {tot["atoms_stable2d"]/tot["atoms"]:8.4f}')
-    print('\nRead the 3D column against the 2D column on the SAME molecules: 2D uses the stored '
+    print('\nCompare the 3D and 2D columns on the same molecules: 2D uses the stored '
           '\nbond orders and a charge-aware valence table, 3D re-infers bonds from distances '
-          '\nwith a charge-blind one. Any gap is the metric, not the chemistry.')
+          '\nwith a charge-blind one. Any gap comes from the metric, not the molecules.')
 
 
 if __name__ == '__main__':

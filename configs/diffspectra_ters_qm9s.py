@@ -4,10 +4,11 @@ configs/diffspectra_ters.py with data-dependent overrides; pair with configs/bas
 """
 
 from configs.diffspectra_ters import get_config as _ters_config
+from env import data_root
 
 
-QM9S_ROOT = '/scratch/project_2001912/sethih1/QM9S-dataset/qm9s_hdf5_64px_5A'
-QM9S_GRAPHS = '/scratch/project_2001912/sethih1/qm9s-ters/graphs'
+QM9S_ROOT = data_root('QM9S-dataset', 'qm9s_hdf5_64px_5A')
+QM9S_GRAPHS = data_root('qm9s-ters', 'graphs')
 
 
 def get_config():

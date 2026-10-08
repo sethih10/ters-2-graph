@@ -8,6 +8,8 @@ import os
 import ml_collections
 import torch
 
+from env import data_root, output_root
+
 
 def get_config():
     config = ml_collections.ConfigDict()
@@ -18,9 +20,9 @@ def get_config():
 
     # data
     config.data = data = ml_collections.ConfigDict()
-    data.root = '/scratch/project_2001912/sethih1/stm-data'
+    data.root = data_root('stm-data')
     # {train,val,test}.h5; the cube <split>/X has shape (N, 128, 128, 14), one channel per z-slice.
-    data.graph_root = '/scratch/project_2001912/sethih1/stm-graphs'   # from datasets.preprocess_stm
+    data.graph_root = data_root('stm-graphs')   # from datasets.preprocess_stm
     data.name = 'STM'                    # selects the dataset/collate/encoder branches
     data.processed_file = ''
     data.info_name = 'stm_10elem'        # 10-element entry in datasets_config
@@ -104,7 +106,7 @@ def get_config():
 
     # '' trains the clip encoder from scratch; requires stm_encoder == 'clip'.
     model.pretrained_stm_encoder_path = (
-        '/scratch/project_2001912/sethih1/runs/clip-full-1264302/cube_encoder_best.pt')
+        output_root('runs', 'clip-full-1264302', 'cube_encoder_best.pt'))
 
     # # loss function
     model.loss_weights = '1., 0.25, 0.1'
@@ -145,7 +147,7 @@ def get_config():
     training.snapshot_freq = 25000 // training.num_gpus
     # Resume checkpoint, overwritten in place.
     training.snapshot_freq_for_preemption = 2000 // training.num_gpus
-    # Must stay False: sampling.py has no cube branch. Use tools.generation.sample_cond instead.
+    # Sampling during training; generation after training uses sample.py.
     training.snapshot_sampling = False
 
     # Weights & Biases logging; every key is read through getattr.

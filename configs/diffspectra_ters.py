@@ -8,6 +8,8 @@ import os
 import ml_collections
 import torch
 
+from env import data_root
+
 
 def get_config():
     config = ml_collections.ConfigDict()
@@ -18,7 +20,7 @@ def get_config():
 
     # data
     config.data = data = ml_collections.ConfigDict()
-    data.root = '/scratch/project_2001912/sethih1/planar_hdf5_0.5'   # {train,val,test}.h5
+    data.root = data_root('planar_hdf5_0.5')   # {train,val,test}.h5
     data.graph_root = 'datasets/ters'    # graphs_{split}.pt from datasets.preprocess_ters
     data.name = 'TERS'                   # selects the dataset/collate/encoder branches
     data.processed_file = ''
@@ -122,7 +124,7 @@ def get_config():
     # n_iters must be a multiple of this; eval.begin_ckpt = n_iters // snapshot_freq.
     training.snapshot_freq = 5000 // training.num_gpus
     training.snapshot_freq_for_preemption = 2000 // training.num_gpus
-    # Must stay False: sampling.py has no cube branch. Use tools.generation.sample_cond instead.
+    # Sampling during training; generation after training uses sample.py.
     training.snapshot_sampling = False
 
     # Weights & Biases logging; every key is read through getattr.

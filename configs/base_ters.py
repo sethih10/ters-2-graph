@@ -6,6 +6,8 @@ Only its graph splits are read, as reference molecules for the metrics; cubes ar
 import ml_collections
 import torch
 
+from env import data_root
+
 
 def get_config():
     config = ml_collections.ConfigDict()
@@ -16,7 +18,7 @@ def get_config():
 
     # data
     config.data = data = ml_collections.ConfigDict()
-    data.root = '/scratch/project_2001912/sethih1/planar_hdf5_0.5'
+    data.root = data_root('planar_hdf5_0.5')
     data.graph_root = 'datasets/ters'
     data.name = 'TERS'
     data.processed_file = ''

@@ -408,7 +408,7 @@ def _cone(h5_path, split=None, n=256, seed=0):
             E = enc(normed)
         print(f'  {name}: mean pairwise cosine {_mean_pairwise_cosine(E):+.6f}   '
               f'std/|act| {float(E.std(0).mean() / E.abs().mean()):.4f}')
-    print('  reference (tools/diagnostics/diagnose_conditioning.py, real runs): '
+    print('  reference (trained models, real cubes): '
           'v1 @75k 0.984, v1 @150k 0.967, TERS @28k 0.925')
 
 

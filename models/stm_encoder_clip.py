@@ -17,9 +17,6 @@ from torch import nn
 from .ters_encoder import ResBlock, _groups_for
 from .stm_encoder import NormalizeStmCube  # noqa: F401  (re-exported)
 
-DEFAULT_CKPT = ('/scratch/project_2001912/sethih1/runs/clip-full-1264302/'
-                'cube_encoder_best.pt')
-
 
 class ResBlock3d(nn.Module):
     """3D residual block: conv-norm-ReLU, conv-norm, skip connection, ReLU.
@@ -402,7 +399,7 @@ def _self_test():
     return checks == total
 
 
-def _load(ckpt_path=DEFAULT_CKPT, in_channels=14):
+def _load(ckpt_path, in_channels=14):
     """Strict-load a checkpoint, print its geometry and run one forward pass on random input."""
     geom = read_ckpt_geometry(ckpt_path)
     print(f'{ckpt_path}\n  geometry from weights: {geom}')
@@ -417,7 +414,7 @@ def _load(ckpt_path=DEFAULT_CKPT, in_channels=14):
     return enc
 
 
-def _cone(h5_path, ckpt_path=DEFAULT_CKPT, split=None, n=128, seed=0):
+def _cone(h5_path, ckpt_path, split=None, n=128, seed=0):
     """Print the mean pairwise cosine similarity of pretrained and randomly initialised
     embeddings on real cubes."""
     import h5py
@@ -466,10 +463,10 @@ if __name__ == '__main__':
 
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--self-test', action='store_true', help='no data, no cluster, no GPU')
-    ap.add_argument('--load', nargs='?', const=DEFAULT_CKPT, metavar='CKPT',
+    ap.add_argument('--load', metavar='CKPT',
                     help='strict-load the real checkpoint and report its geometry')
     ap.add_argument('--cone', metavar='H5', help='pretrained vs random cone on real cubes')
-    ap.add_argument('--ckpt', default=DEFAULT_CKPT)
+    ap.add_argument('--ckpt', help='checkpoint for --cone')
     ap.add_argument('--split', default=None)
     ap.add_argument('-n', type=int, default=128)
     a = ap.parse_args()
@@ -478,6 +475,8 @@ if __name__ == '__main__':
         raise SystemExit(0 if _self_test() else 1)
     if a.load:
         _load(a.load)
+    if a.cone and not a.ckpt:
+        ap.error('--cone requires --ckpt')
     if a.cone:
         _cone(a.cone, ckpt_path=a.ckpt, split=a.split, n=a.n)
     if not (a.self_test or a.load or a.cone):

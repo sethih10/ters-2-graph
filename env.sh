@@ -22,8 +22,9 @@ pip install pandas
 
 git clone git@github.com:AzureLeon1/moses.git
 mv moses moses-diffspectra
-cd moses-diffspectra
-python setup.py install
+(
+    cd moses-diffspectra && python setup.py install
+)
 
 pip install numpy==1.26.4
 pip install ml_collections==0.1.1

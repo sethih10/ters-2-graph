@@ -4,12 +4,10 @@ import logging
 import numpy as np
 import random
 import pickle
+import json
 import pandas as pd
 # from torch.utils import tensorboard
-# ^ left commented deliberately. Experiment tracking on this project goes through wandb
-#   (ters_wandb.py); see the D-9 entry in docs/05-progress-log.md.
 
-# --- ADDED (wandb) ---------------------------------------------------------
 import ters_wandb
 
 from datasets import get_dataset, inf_iterator, get_dataloader
@@ -176,10 +174,16 @@ def compute_similarity_metrics(pred_rdmols, true_rdmols, eval_dir, ckpt):
 def diffspectra_train(config, config_original_qm9, workdir):
     """Runs the training pipeline with VPSDE for geometry graphs with additional quantum property conditioning."""
 
+    # Must run before get_dataloader and create_model, which need the rank and device.
+    import distributed
+    ddp_rank, ddp_world = distributed.init(config)
+    is_main = distributed.is_main()
+    logging.info(distributed.describe(config))
+
     # Create directories for experimental logs
     sample_dir = os.path.join(workdir, "samples")
-    if not os.path.exists(sample_dir):
-        os.makedirs(sample_dir)
+    if is_main and not os.path.exists(sample_dir):
+        os.makedirs(sample_dir, exist_ok=True)
 
     # Build dataset and dataloader
     _, second_train_ds, val_ds, test_ds, dataset_info = get_dataset(config)  # only use second_train (second part of training set) when training diffusion
@@ -209,11 +213,13 @@ def diffspectra_train(config, config_original_qm9, workdir):
     checkpoint_dir = os.path.join(workdir, "checkpoints")
     # Intermediate checkpoints to resume training
     checkpoint_meta_dir = os.path.join(workdir, "checkpoints-meta", "checkpoint.pth")
-    if not os.path.exists(checkpoint_dir):
-        os.makedirs(checkpoint_dir)
-    if not os.path.exists(os.path.dirname(checkpoint_meta_dir)):
-        os.makedirs(os.path.dirname(checkpoint_meta_dir))
+    if is_main:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        os.makedirs(os.path.dirname(checkpoint_meta_dir), exist_ok=True)
+    # The directories must exist before any rank reads them.
+    distributed.barrier()
     # Resume training when intermediate checkpoints are detected
+    # Every rank restores: DDP does not broadcast the optimizer state or the step.
     state = restore_checkpoint(checkpoint_meta_dir, state, config.device)
     initial_step = int(state['step'])
     num_train_steps = config.training.n_iters
@@ -237,10 +243,8 @@ def diffspectra_train(config, config_original_qm9, workdir):
     EDM_metric_2D = get_2D_edm_metric(dataset_info)
     logging.info('loading test mols')
 
-    # --- ADDED (wandb): start the run, or a no-op if disabled/unavailable ----
-    # Placed after restore_checkpoint so resume='allow' can rejoin the same run rather
-    # than opening a second one for a preempted job.
-    wandb_run = ters_wandb.init(config, workdir)
+    # After restore_checkpoint, so a resumed job rejoins its wandb run.
+    wandb_run = ters_wandb.init(config, workdir) if is_main else ters_wandb._NoOp()
 
     # Training iterations
     for step in range(initial_step, num_train_steps + 1):
@@ -250,14 +254,11 @@ def diffspectra_train(config, config_original_qm9, workdir):
         loss = train_step_fn(state, batch)
 
         if step % config.training.log_freq == 0:
-            logging.info("step: %d, training_loss: %.5e" % (step, loss.item()))
-            # --- ADDED (wandb) ----------------------------------------------
-            # Logged on the same cadence as the stdout line so the two never disagree.
-            # loss.item() is already synchronised by the line above, so this adds no
-            # extra GPU stall. LR matters here because optim.warmup=2000 means the first
-            # 2000 steps run at a fraction of target (losses.py:88) -- a loss curve that
-            # ignores it is unreadable over exactly the region people squint at.
-            metrics = {'train/loss': loss.item()}
+            # Collective: every rank must call it, so it stays outside the is_main guard.
+            loss_val = distributed.all_reduce_mean(loss.item(), config.device)
+        if step % config.training.log_freq == 0 and is_main:
+            logging.info("step: %d, training_loss: %.5e" % (step, loss_val))
+            metrics = {'train/loss': loss_val}
             if optimize_fn.last_lr is not None:
                 metrics['train/lr'] = optimize_fn.last_lr
             if optimize_fn.last_grad_norm is not None:
@@ -268,14 +269,18 @@ def diffspectra_train(config, config_original_qm9, workdir):
 
         # Save a temporary checkpoint to resume training after pre-emption periodically
         if step != 0 and step % config.training.snapshot_freq_for_preemption == 0:
-            save_checkpoint(checkpoint_meta_dir, state)
+            if is_main:
+                save_checkpoint(checkpoint_meta_dir, state)
+            distributed.barrier()
 
         # Save a checkpoint periodically and generate samples
         if step != 0 and step % config.training.snapshot_freq == 0 or step == num_train_steps:
 
             # Save the checkpoint.
             save_step = step // config.training.snapshot_freq
-            save_checkpoint(os.path.join(checkpoint_dir, f'checkpoint_{save_step}.pth'), state)
+            if is_main:
+                save_checkpoint(os.path.join(checkpoint_dir, f'checkpoint_{save_step}.pth'), state)
+            distributed.barrier()
 
             # Generate, evaluate and save samples
             if config.training.snapshot_sampling:
@@ -315,9 +320,6 @@ def diffspectra_train(config, config_original_qm9, workdir):
                     os.makedirs(this_gt_vis_dir)
                 visualize.visualize_mols(groundtruth_rdmols, this_gt_vis_dir, config)
 
-    # --- ADDED (wandb): close the run so an offline dir is syncable ----------
-    # Outside the loop, so it also runs when training ends normally. A killed job never
-    # reaches this, which is fine: `wandb sync` reads a partial offline directory happily.
     wandb_run.finish()
 
 
@@ -412,6 +414,14 @@ def diffspectra_evaluate(config, config_original_qm9, workdir, eval_folder="eval
                             " unique & valid: %.4f, unique & valid & novelty: %.4f" % (stability_res['atom_stable'],
                             stability_res['mol_stable'], rdkit_res['Validity'], rdkit_res['Complete'], rdkit_res['Unique'],
                             rdkit_res['Novelty']))
+            geometry_res = get_geometry_metrics(processed_mols, dataset_info)
+            logging.info('Geometry-3D || valence: %.4f, bond lengths: %.4f, '
+                         'angle distances: %.4f, no clashes: %.4f, all checks: %.4f',
+                         geometry_res['valence_valid'], geometry_res['bond_lengths_valid'],
+                         geometry_res['angle_distances_valid'], geometry_res['no_clashes'],
+                         geometry_res['geometry_valid'])
+            with open(os.path.join(eval_dir, 'geometry_3d_%d.json' % ckpt), 'w') as f:
+                json.dump(geometry_res, f, indent=2)
             mose_res = mose_metric(complete_rdmols)
             logging.info("Metric-2D || FCD: %.4f, SNN: %.4f, Frag: %.4f, Scaf: %.4f, IntDiv: %.4f" % (mose_res['FCD'],
                             mose_res['SNN'], mose_res['Frag'], mose_res['Scaf'], mose_res['IntDiv']))

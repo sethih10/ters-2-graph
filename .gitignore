@@ -15,15 +15,18 @@ env.sh
 
 assets/
 
-slurm/*
-!slurm/run_metrics_testset.sbatch
-!slurm/run_metrics_gpumedium.sbatch
-!slurm/score_cpu.sbatch
-!slurm/score_run.sbatch
+docs/
+
+tests/
+
+slurm/
+slurm/logs/
+
 slurm-scripts/
 
 tests/*
 !tests/test_geometry.py
+!tests/test_env.py
 
 
 !.env.example

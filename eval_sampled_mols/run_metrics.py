@@ -40,7 +40,7 @@ def sample_cmd(args, split, shuffled, out_dir):
     cmd = [sys.executable, 'sample.py',
            '--modality', args.modality,
            '--ckpt', args.ckpt,
-           '--config', cfg, '--config-qm9', cfg_q,
+           '--config', cfg, '--config_original_qm9', cfg_q,
            '--split', split,
            '--n-mols', str(args.n_mols),
            '--n-samples', str(args.n_samples),
@@ -52,6 +52,7 @@ def sample_cmd(args, split, shuffled, out_dir):
         cmd.append('--no-geometry')
     if shuffled:
         cmd.append('--shuffle-cubes')
+    cmd.extend(args.config_overrides)
     return cmd
 
 
@@ -66,7 +67,7 @@ def score_cmd(args, cells):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
+    ap = argparse.ArgumentParser(description=__doc__, allow_abbrev=False,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--ckpt', required=True)
     ap.add_argument('--modality', default='stm', choices=sorted(CONFIGS))
@@ -92,7 +93,10 @@ def main():
                     help='score pickles that already exist instead of regenerating them')
     ap.add_argument('--dry-run', action='store_true',
                     help='print every command and exit without running or writing anything')
-    args = ap.parse_args()
+    args, args.config_overrides = ap.parse_known_args()
+    if any(not arg.startswith('--config.') or '=' not in arg
+           for arg in args.config_overrides):
+        ap.error('extra arguments must be configuration overrides: --config.FIELD=VALUE')
     args.out = args.out or output_root('stm-eval', 'paper_metrics')
 
     if max(args.ks) > args.n_samples:

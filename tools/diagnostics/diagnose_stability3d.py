@@ -7,8 +7,10 @@ Usage
 -----
     python -m tools.diagnostics.diagnose_stability3d [-n N]
 """
-import argparse, importlib.util, os, sys, collections
+import argparse, os, sys, collections
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from ml_collections.config_flags.config_flags import ConfigFileFlagParser
+
 import torch
 from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
@@ -27,9 +29,8 @@ def main():
     ap.add_argument('--seed', type=int, default=0)
     a = ap.parse_args()
 
-    spec = importlib.util.spec_from_file_location('cfg', a.config_qm9)
-    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-    _, _, _, test_ds, _ = get_dataset(m.get_config())
+    config = ConfigFileFlagParser('config_original_qm9').parse(a.config_qm9)
+    _, _, _, test_ds, _ = get_dataset(config)
     info = get_dataset_info(a.info)
     dec = info['atom_decoder']
 

@@ -1,4 +1,5 @@
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
@@ -86,22 +87,16 @@ def optimization_manager(config):
         if warmup > 0:
             for g in optimizer.param_groups:
                 g['lr'] = lr * np.minimum(step / warmup, 1.0)
-        # --- ADDED (wandb): surface LR and grad-norm for logging ------------
-        # Read back rather than recomputed, so what gets logged is what the optimizer
-        # actually used. Attached to the function object instead of returned, because
-        # optimize_fn's return value is unused by every caller and changing the signature
-        # would touch losses.get_step_fn and both run_lib entry points for a metric.
+        # Last LR and gradient norm, read by run_lib for logging.
         optimize_fn.last_lr = float(optimizer.param_groups[0]['lr'])
         if grad_clip >= 0:
             # torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip)
             grad_norm = gradient_clipping(params, gradnorm_queue, grad_clip, disable_log)
-            # gradient_clipping returns None on the max_grad <= 1.0 branch (losses.py:29-31),
-            # which config.optim.grad_clip = 10. does not take -- but do not assume it.
+            # gradient_clipping returns None when max_grad <= 1.0.
             optimize_fn.last_grad_norm = None if grad_norm is None else float(grad_norm)
         optimizer.step()
 
-    # Defined up front so a reader of optimize_fn.last_* never sees an AttributeError
-    # on step 0, before the first optimiser call has happened.
+    # Initialised here so optimize_fn.last_* exist before the first optimizer step.
     optimize_fn.last_lr = None
     optimize_fn.last_grad_norm = None
     return optimize_fn
@@ -136,6 +131,24 @@ def get_step_fn(noise_scheduler, train, optimize_fn, scaler, config, prop_dist=N
         return loss
 
     return step_fn
+
+
+
+def _self_cond_draw():
+    """Self-conditioning coin flip, broadcast from rank 0 so all DDP ranks take the same branch."""
+    flag = random() < 0.5
+    if dist.is_available() and dist.is_initialized():
+        t = torch.tensor([1 if flag else 0], device=torch.cuda.current_device())
+        dist.broadcast(t, src=0)
+        flag = bool(t.item())
+    return flag
+
+
+def _self_cond_module(model):
+    """Model for the no-grad self-conditioning pass; unwraps DDP, which rejects a second forward."""
+    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+        return model.module
+    return model
 
 
 def get_sde_node_loss_fn(noise_scheduler, train, scaler, config):
@@ -179,9 +192,9 @@ def get_sde_node_loss_fn(noise_scheduler, train, scaler, config):
         if self_cond:
             assert pred_data
             cond_x = None
-            if random() < 0.5:
+            if _self_cond_draw():
                 with torch.no_grad():
-                    cond_x = model(t, z_t, node_mask, edge_mask, noise_level=noise_level, cond_x=cond_x)
+                    cond_x = _self_cond_module(model)(t, z_t, node_mask, edge_mask, noise_level=noise_level, cond_x=cond_x)
                     cond_x = cond_x.detach_()
             pred = model(t, z_t, node_mask, edge_mask, noise_level=noise_level, cond_x=cond_x)
         else:
@@ -256,9 +269,9 @@ def get_sde_2D_loss_fn(noise_scheduler, train, scaler, config):
         if self_cond:
             assert pred_data
             cond_x, cond_edge_x = None, None
-            if random() < 0.5:
+            if _self_cond_draw():
                 with torch.no_grad():
-                    cond_x, cond_edge_x = model(t, z_t, node_mask, edge_mask, edge_x=edge_z_t, noise_level=noise_level,
+                    cond_x, cond_edge_x = _self_cond_module(model)(t, z_t, node_mask, edge_mask, edge_x=edge_z_t, noise_level=noise_level,
                                                 cond_x=cond_x, cond_edge_x=cond_edge_x, context=context)
                     cond_x, cond_edge_x = cond_x.detach_(), cond_edge_x.detach_()
             pred, edge_pred = model(t, z_t, node_mask, edge_mask, edge_x=edge_z_t, noise_level=noise_level,
@@ -354,9 +367,9 @@ def get_sde_graph_loss_fn(noise_scheduler, train, scaler, config, prop_norm=None
         if self_cond:
             assert pred_data
             cond_x, cond_edge_x = None, None
-            if random() < 0.5:
+            if _self_cond_draw():
                 with torch.no_grad():
-                    cond_x, cond_edge_x = model(t, z_t, node_mask, edge_mask, edge_x=edge_z_t, noise_level=noise_level,
+                    cond_x, cond_edge_x = _self_cond_module(model)(t, z_t, node_mask, edge_mask, edge_x=edge_z_t, noise_level=noise_level,
                                                 cond_x=cond_x, cond_edge_x=cond_edge_x, context=context,
                                                 alpha_t=alpha_t, sigma_t=sigma_t)
                     cond_x, cond_edge_x = cond_x.detach_(), cond_edge_x.detach_()

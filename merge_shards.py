@@ -104,7 +104,7 @@ def main():
 
     print(f'\nmerged {len(truth)} targets x {n_samples} samples = {len(generated)} molecules '
           f'-> {args.out}')
-    print(f'score it with:\n  OUT={args.out} sbatch slurm/score_run.sbatch')
+    print(f'score it with:\n  OUT={args.out} sbatch slurm/shared/evaluation/score_run.sbatch')
 
 
 if __name__ == '__main__':

@@ -36,7 +36,7 @@ CAVEAT_3D = ('Metric-3D is not calibrated for this corpus: on 500 ground-truth t
              'with this caveat.')
 
 
-from config_utils import load_config
+from ml_collections.config_flags.config_flags import ConfigFileFlagParser
 
 
 def _cache_path(cfg_aux_path, config, max_ref):
@@ -51,7 +51,7 @@ def reference_sets(cfg_aux_path, max_ref, use_cache=False):
 
     Splits match ``run_lib.diffspectra_evaluate``. ``cfg_aux_path`` is the graph-only aux config.
     """
-    config = load_config(cfg_aux_path)
+    config = ConfigFileFlagParser('config_original_qm9').parse(cfg_aux_path)
     cache = _cache_path(cfg_aux_path, config, max_ref)
 
     _, train_ds, _, test_ds, dataset_info = get_dataset(config)
@@ -98,7 +98,7 @@ def reference_sets(cfg_aux_path, max_ref, use_cache=False):
 def ground_truth_cells(cfg_aux_path, n, split='test', seed=0):
     """Return ``n`` random ground-truth molecules from ``split`` as a calibration cell."""
     import torch
-    config = load_config(cfg_aux_path)
+    config = ConfigFileFlagParser('config_original_qm9').parse(cfg_aux_path)
     _, train_ds, _, test_ds, _ = get_dataset(config)
     ds = train_ds if split == 'train' else test_ds
     n = len(ds) if n <= 0 else min(n, len(ds))

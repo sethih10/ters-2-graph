@@ -5,7 +5,7 @@ chance and mean pairwise cosine, for the trained EMA model and the encoder at in
 
 Usage
 -----
-    python -m tools.diagnostics.probe_conditioning --ckpt CKPT [--no-control] [--set KEY=VALUE]
+    python -m tools.diagnostics.probe_conditioning --ckpt CKPT [--no-control] [--config.model.nf=512]
 """
 
 import argparse
@@ -16,7 +16,10 @@ import torch
 from datasets import get_dataset, get_dataloader
 from models import create_model
 from models.ema import ExponentialMovingAverage
-from config_utils import add_set_arg, load_config
+import sys
+
+from absl import flags
+from ml_collections import config_flags
 
 
 def unwrap(m):
@@ -117,22 +120,32 @@ def probe_one(model, loader, device, n, lam, seed, label):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument('--ckpt', required=True)
-    ap.add_argument('--config', default='configs/diffspectra_stm.py')
-    ap.add_argument('--config-qm9', default='configs/base_stm.py')
+    ap.add_argument('--config', help='Python config file; override fields with --config.FIELD=VALUE', default='configs/diffspectra_stm.py')
+    ap.add_argument('--config_original_qm9', '--config-qm9', dest='config_qm9', default='configs/base_stm.py')
     ap.add_argument('--n', type=int, default=1024, help='molecules to probe')
     ap.add_argument('--lam', type=float, default=1.0, help='ridge penalty')
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--no-control', action='store_true',
                     help='skip the control run with the encoder at initialisation; without it '
                          'the trained numbers have no baseline')
-    add_set_arg(ap)
-    args = ap.parse_args()
+    args, config_overrides = ap.parse_known_args()
 
-    config = load_config(args.config, args.overrides)
+    config_argv = [sys.argv[0], f'--config={args.config}',
+                   f'--config_original_qm9={args.config_qm9}', *config_overrides]
+    config_values = flags.FlagValues()
+    config_flags.DEFINE_config_file('config', flag_values=config_values,
+                                    sys_argv=config_argv)
+    config_flags.DEFINE_config_file('config_original_qm9', flag_values=config_values,
+                                    sys_argv=config_argv)
+    try:
+        config_values(config_argv)
+    except flags.Error as exc:
+        ap.error(str(exc))
+    config = config_values.config
     config.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    cfg_q = load_config(args.config_qm9)
+    cfg_q = config_values.config_original_qm9
     _, _, val_ds, test_ds, _ = get_dataset(config)
     get_dataset(cfg_q)
     _, val_loader, _ = get_dataloader(val_ds, val_ds, test_ds, config)

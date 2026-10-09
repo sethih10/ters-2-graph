@@ -5,9 +5,9 @@ and the paired t statistic.
 
 Usage
 -----
-    python -m tools.diagnostics.diagnose_cond_by_t --ckpt CKPT [--set KEY=VALUE]
+    python -m tools.diagnostics.diagnose_cond_by_t --ckpt CKPT [--config.model.nf=512]
 """
-import argparse, importlib.util, random
+import argparse, random
 import numpy as np
 import torch
 
@@ -17,22 +17,35 @@ from models import create_model
 import losses
 from utils import get_data_scaler
 from diffusion import NoiseScheduleVP
-from config_utils import add_set_arg, load_config
+import sys
+
+from absl import flags
+from ml_collections import config_flags
 from tools.diagnostics.diagnose_progress import FixedT
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument('--ckpt', required=True)
-    ap.add_argument('--config', default='configs/diffspectra_ters.py')
-    ap.add_argument('--config-qm9', default='configs/base_ters.py')
+    ap.add_argument('--config', help='Python config file; override fields with --config.FIELD=VALUE', default='configs/diffspectra_ters.py')
+    ap.add_argument('--config_original_qm9', '--config-qm9', dest='config_qm9', default='configs/base_ters.py')
     ap.add_argument('--batches', type=int, default=2)
     ap.add_argument('--seeds', type=int, default=4)
-    add_set_arg(ap)
-    args = ap.parse_args()
+    args, config_overrides = ap.parse_known_args()
 
-    config = load_config(args.config, args.overrides); config.device = torch.device('cuda')
-    cfg_q = load_config(args.config_qm9)
+    config_argv = [sys.argv[0], f'--config={args.config}',
+                   f'--config_original_qm9={args.config_qm9}', *config_overrides]
+    config_values = flags.FlagValues()
+    config_flags.DEFINE_config_file('config', flag_values=config_values,
+                                    sys_argv=config_argv)
+    config_flags.DEFINE_config_file('config_original_qm9', flag_values=config_values,
+                                    sys_argv=config_argv)
+    try:
+        config_values(config_argv)
+    except flags.Error as exc:
+        ap.error(str(exc))
+    config = config_values.config; config.device = torch.device('cuda')
+    cfg_q = config_values.config_original_qm9
     _, _, val_ds, test_ds, _ = get_dataset(config)
     get_dataset(cfg_q)
     _, val_loader, _ = get_dataloader(val_ds, val_ds, test_ds, config)

@@ -30,8 +30,13 @@ ters-2-graph/
 ├── main_finetune.py        # fine-tune with a frozen pretrained denoiser
 ├── run_lib.py              # training and evaluation loops
 ├── losses.py               # diffusion losses and optimizer
+├── utils.py                # checkpoint save/restore, data scaling, self-conditioning
+├── distributed.py          # DistributedDataParallel setup under Slurm
+├── ters_wandb.py           # Weights & Biases logging
 ├── sample.py               # generate molecules from a checkpoint
 ├── merge_shards.py         # merge sharded sample.py outputs
+├── compute_metrics.py      # target-similarity scoring used by main.py --mode eval
+├── visualize.py            # molecule images saved during training
 ├── env.sh, env.py          # environment setup, machine paths from .env
 ├── configs/
 │   ├── diffspectra_*.py    # main configs: TERS, QM9S-TERS, STM
@@ -39,14 +44,22 @@ ters-2-graph/
 │   └── *_frozen*.py        # fine-tuning configs
 ├── datasets/
 │   ├── preprocess_*.py     # HDF5 -> graph files (graphs_{split}.pt)
-│   ├── *_dataset.py        # cube + graph datasets
+│   ├── ters_dataset.py     # TERS cube + graph dataset
+│   ├── stm_dataset.py      # STM cube + graph dataset
+│   ├── qm9s_dataset.py     # DiffSpectra's QM9S spectrum dataset (data.name = 'QM9S')
+│   ├── build_dataset.py    # selects the dataset and batching from data.name
 │   ├── datasets_config.py  # element sets (data.info_name)
 │   └── ters/               # graph files for planar TERS
 ├── models/
-│   ├── dmt.py              # DMT denoiser; builds the conditioning encoder
+│   ├── dmt.py              # DMT denoiser (model.name = 'DMT'); builds the conditioning encoder
+│   ├── layers.py           # DMT attention and message-passing layers
 │   ├── ters_encoder.py     # TERS image encoder
-│   ├── stm_encoder*.py     # STM image encoders
-│   └── ema.py              # exponential moving average of weights
+│   ├── stm_encoder*.py     # STM image encoders (model.stm_encoder = v1, v2, clip)
+│   ├── specformer*.py      # DiffSpectra's 1D spectrum encoder, used when data.name = 'QM9S'
+│   ├── dmt_wo_eq.py        # DiffSpectra's non-equivariant DMT ablation (model.name = 'DMT_WO_EQ')
+│   ├── cdgs.py             # DiffSpectra's CDGS 2D graph model (model.name = 'CDGS')
+│   ├── ema.py              # exponential moving average of weights
+│   └── utils.py            # model registry and create_model
 ├── diffusion/, sampling/   # noise schedule and samplers
 ├── evaluation/             # metric functions
 ├── eval_sampled_mols/      # evaluation commands

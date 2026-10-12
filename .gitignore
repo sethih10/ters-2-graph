@@ -20,17 +20,5 @@ slurm/logs/
 
 slurm-scripts/
 
-tests/*
-!tests/test_geometry.py
-!tests/test_env.py
-
 
 !.env.example
-
-# Keep the frozen-denoiser port guide and focused regression test.
-!docs/
-docs/*
-!docs/frozen-denoiser.md
-!tests/
-tests/*
-!tests/test_frozen.py

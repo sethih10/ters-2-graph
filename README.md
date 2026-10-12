@@ -1,284 +1,240 @@
 # TERS-2-Graph
 
-TERS-2-Graph generates molecular graphs and 3D atomic coordinates conditioned on
-tip-enhanced Raman spectroscopy (TERS) hyperspectral image cubes or scanning
-tunneling microscopy (STM) image stacks. It adapts
-[DiffSpectra](https://github.com/AzureLeon1/DiffSpectra) with image encoders,
-dataset preprocessing, conditional generation, and molecular evaluation.
+TERS-2-Graph generates a molecule (graph and 3D coordinates) from a tip-enhanced Raman
+spectroscopy (TERS) image cube or a scanning tunnelling microscopy (STM) image stack. It
+adapts [DiffSpectra](https://github.com/AzureLeon1/DiffSpectra), replacing its 1D spectrum
+encoder with an image encoder.
 
-The workflow is to prepare graph targets from HDF5 datasets, train a conditional
-diffusion model, generate candidate molecules, and evaluate their recovery and
-chemical quality. Configurations are provided for TERS, STM, and QM9S-TERS.
+```text
+image cube ──► cond_encoder ──► cond_lin ──► DMT denoiser ──► atoms, bonds, charges, 3D coordinates
+ (C×H×W)         (CNN)           (linear)     (DiffSpectra)
+```
 
-**Sampling currently uses the target molecule's atom count.** Evaluation therefore
-measures structure recovery with a known atom count; it does not establish
-recovery from an image alone.
+| Dataset | Input | Elements | Config |
+| --- | --- | --- | --- |
+| Planar TERS | 256×256 px × 100 channels | H C N O | `diffspectra_ters.py` |
+| QM9S-TERS | 64×64 px × 100 channels | H C N O F | `diffspectra_ters_qm9s.py` |
+| STM | 14 z-slices | H C N O F Si P S Cl Br | `diffspectra_stm.py` |
+
+There are two ways to train:
+
+- **From scratch** with `main.py`: the encoder and the denoiser are trained together.
+- **Fine-tuning** with `main_finetune.py`: a pretrained DiffSpectra denoiser is frozen,
+  and only the encoder is trained.
+
+## Repository layout
+
+```text
+ters-2-graph/
+├── main.py                 # train or evaluate from scratch
+├── main_finetune.py        # fine-tune with a frozen pretrained denoiser
+├── run_lib.py              # training and evaluation loops
+├── losses.py               # diffusion losses and optimizer
+├── sample.py               # generate molecules from a checkpoint
+├── merge_shards.py         # merge sharded sample.py outputs
+├── env.sh, env.py          # environment setup, machine paths from .env
+├── configs/
+│   ├── diffspectra_*.py    # main configs: TERS, QM9S-TERS, STM
+│   ├── base_*.py           # auxiliary configs: graph-only reference sets
+│   └── *_frozen*.py        # fine-tuning configs
+├── datasets/
+│   ├── preprocess_*.py     # HDF5 -> graph files (graphs_{split}.pt)
+│   ├── *_dataset.py        # cube + graph datasets
+│   ├── datasets_config.py  # element sets (data.info_name)
+│   └── ters/               # graph files for planar TERS
+├── models/
+│   ├── dmt.py              # DMT denoiser; builds the conditioning encoder
+│   ├── ters_encoder.py     # TERS image encoder
+│   ├── stm_encoder*.py     # STM image encoders
+│   └── ema.py              # exponential moving average of weights
+├── diffusion/, sampling/   # noise schedule and samplers
+├── evaluation/             # metric functions
+├── eval_sampled_mols/      # evaluation commands
+└── tools/                  # diagnostics, analysis, visualisation
+```
 
 ## Setup
 
-Run the commands below from the repository root. You will need:
+```bash
+source env.sh              # creates and activates the "ters-2-graph" Conda environment
+cp .env.example .env       # then set DATA_ROOT and OUTPUT_ROOT
+```
 
-- A Python environment with PyTorch, PyTorch Geometric, RDKit, ASE, and HDF5 support.
-- A CUDA-capable GPU for the supplied training configurations and `sample.py`.
-- Split HDF5 datasets, supplied separately. Generation also requires a trained checkpoint.
+- **Paths.** `DATA_ROOT` holds the datasets and `OUTPUT_ROOT` holds runs and pretrained
+  encoders. Exported environment variables override `.env`.
+- **Logging.** Training logs to Weights & Biases. Set `WANDB_API_KEY` in `.env`, or pass
+  `--config.training.wandb.enabled=False`.
 
-Install the dependencies with [env.sh](env.sh) from a Conda-enabled shell:
+## Data
+
+A dataset is a directory with `train.h5`, `val.h5` and `test.h5`. These hold the image
+cubes, atom positions and atomic numbers. A preprocessing step writes one graph file
+`graphs_{split}.pt` per split. Each graph file stores the target molecule for every HDF5
+row, with bonds inferred from geometry with RDKit.
 
 ```bash
-source env.sh
+# TERS / QM9S-TERS (--elements hcno or hcnof)
+python -m datasets.preprocess_ters --data-dir $DATA_ROOT/planar_hdf5_0.5 --out-dir datasets/ters --stats
+
+# STM
+python -m datasets.preprocess_stm --data-dir $DATA_ROOT/stm-data --out-dir $DATA_ROOT/stm-graphs --stats
 ```
 
-The script creates and activates the `ters-2-graph` Conda environment and installs
-the packages needed for training, generation, and evaluation.
+- **Paths in the config.** Set `data.root` to the HDF5 directory and `data.graph_root` to
+  the graph directory. The graph files for planar TERS are included in `datasets/ters`.
+- **Unfamiliar file.** `--inspect` prints the layout of an HDF5 file.
+- **Self-test.** `--self-test` checks a preprocessor on synthetic data.
 
-The script targets Python 3.10, PyTorch 2.3.1 with CUDA 12.1, and PyTorch Geometric
-2.4.0. Adjust the PyTorch and PyG builds if your platform requires different ones.
-Its MOSES clone command uses GitHub SSH access; change it to HTTPS if needed.
-For later sessions, activate the environment with `conda activate ters-2-graph`.
+## Train from scratch
 
-### Machine paths and logging
+Each run takes a main config and an auxiliary config. The auxiliary config is the
+graph-only reference set used by the evaluation metrics. Its flag keeps DiffSpectra's
+name, `--config_original_qm9`.
 
-Copy the environment template, then replace its example paths:
-
-```bash
-cp .env.example .env
-```
-
-```dotenv
-DATA_ROOT=/absolute/path/to/data
-OUTPUT_ROOT=/absolute/path/to/outputs
-WANDB_API_KEY=
-```
-
-[env.py](env.py) loads `.env` when resolving paths. Exported environment variables
-take precedence. `DATA_ROOT` locates datasets; `OUTPUT_ROOT` supplies default
-output and pretrained-encoder locations. Explicit `--workdir` and `--out`
-arguments select the output directory for a particular command.
-
-Training configurations enable online Weights & Biases logging by default.
-Supply a `WANDB_API_KEY`, use `--config.training.wandb.mode=offline`, or disable
-logging with `--config.training.wandb.enabled=False`.
-
-## Prepare the data
-
-Each dataset consists of `train.h5`, `val.h5`, and `test.h5`, paired with
-`graphs_train.pt`, `graphs_val.pt`, and `graphs_test.pt`. These graph files
-("sidecars") store molecular targets and their corresponding HDF5 row indices.
-The preprocessing scripts infer bonds from atomic geometry, encode the graphs,
-and validate the records.
-
-The configurations use these locations by default:
-
-| Dataset | HDF5 directory | Graph directory | Image key |
-| --- | --- | --- | --- |
-| TERS | `DATA_ROOT/planar_hdf5_0.5` | `datasets/ters` in this repository | `channels_100` |
-| STM | `DATA_ROOT/stm-data` | `DATA_ROOT/stm-graphs` | `<split>/X` |
-| QM9S-TERS | `DATA_ROOT/QM9S-dataset/qm9s_hdf5_64px_5A` | `DATA_ROOT/qm9s-ters/graphs` | `channels_100` |
-
-Prepare the dataset you intend to use. Replace `/absolute/path/to/data` in these
-commands with your `DATA_ROOT`; Python's `.env` loading does not set shell variables.
-
-```bash
-# TERS: H/C/N/O targets
-python -m datasets.preprocess_ters \
-    --data-dir /absolute/path/to/data/planar_hdf5_0.5 \
-    --out-dir datasets/ters --stats
-
-# STM: H/C/N/O/F/Si/P/S/Cl/Br targets
-python -m datasets.preprocess_stm \
-    --data-dir /absolute/path/to/data/stm-data \
-    --out-dir /absolute/path/to/data/stm-graphs --stats
-
-# QM9S-TERS: H/C/N/O/F targets
-python -m datasets.preprocess_ters \
-    --data-dir /absolute/path/to/data/QM9S-dataset/qm9s_hdf5_64px_5A \
-    --out-dir /absolute/path/to/data/qm9s-ters/graphs \
-    --elements hcnof --stats
-```
-
-To inspect an unfamiliar HDF5 file before preprocessing:
-
-```bash
-python -m datasets.preprocess_ters --h5 /path/to/train.h5 --inspect
-python -m datasets.preprocess_stm --inspect /path/to/train.h5
-```
-
-Both preprocessors expose `--help` and a `--self-test` that requires no external data.
-
-## Configure and train
-
-Use a matching pair of configurations. The main configuration controls the model,
-data, training, and sampling. The auxiliary configuration supplies reference graph
-datasets for evaluation; the flag retains its upstream name, `--config_original_qm9`.
-
-| Dataset | Main configuration | Auxiliary configuration |
+| Dataset | Main config | Auxiliary config |
 | --- | --- | --- |
-| TERS | [diffspectra_ters.py](configs/diffspectra_ters.py) | [base_ters.py](configs/base_ters.py) |
-| STM | [diffspectra_stm.py](configs/diffspectra_stm.py) | [base_stm.py](configs/base_stm.py) |
-| QM9S-TERS | [diffspectra_ters_qm9s.py](configs/diffspectra_ters_qm9s.py) | [base_ters_qm9s.py](configs/base_ters_qm9s.py) |
-
-Check `data.root` and `data.graph_root` in both configurations. If you relocate a
-dataset, update both paths consistently. Match the element set, image channel count,
-and encoder architecture to your data and any checkpoint you load.
-
-For example, train an STM model with an encoder initialized from scratch and
-W&B logging disabled:
+| Planar TERS | `configs/diffspectra_ters.py` | `configs/base_ters.py` |
+| QM9S-TERS | `configs/diffspectra_ters_qm9s.py` | `configs/base_ters_qm9s.py` |
+| STM | `configs/diffspectra_stm.py` | `configs/base_stm.py` |
 
 ```bash
-python main.py \
-    --config configs/diffspectra_stm.py \
-    --config_original_qm9 configs/base_stm.py \
-    --config.model.pretrained_stm_encoder_path='' \
-    --config.training.wandb.enabled=False \
-    --mode train \
-    --workdir /path/to/run
+python main.py --mode train --workdir RUN \
+    --config configs/diffspectra_ters.py --config_original_qm9 configs/base_ters.py
 ```
 
-The default STM configuration uses the `clip` encoder and expects pretrained
-weights at `OUTPUT_ROOT/runs/clip-full-1264302/cube_encoder_best.pt`. To use
-pretrained weights, replace the empty override with your encoder checkpoint path.
-For TERS or QM9S-TERS, select the corresponding configuration pair and omit the
-STM encoder override.
+- **Outputs.** Checkpoints go to `RUN/checkpoints/checkpoint_N.pth`.
+- **Resuming.** An existing `RUN` resumes from `RUN/checkpoints-meta/`, so use a new
+  directory for each new run.
+- **Overrides.** Any field can be overridden with `--config.FIELD=VALUE`.
+- **Multiple GPUs.** The default is DataParallel. `--config.training.ddp=True` switches to
+  DistributedDataParallel. It needs one `srun` task per GPU, plus `MASTER_ADDR` and
+  `MASTER_PORT`.
+- **STM encoder.** The STM config loads a pretrained encoder from `OUTPUT_ROOT`. Pass
+  `--config.model.pretrained_stm_encoder_path=''` to train it from scratch.
 
-Configuration fields can be overridden as `--config.FIELD=VALUE`, for example
-`--config.training.batch_size=16`. Review batch size and worker count for your
-hardware. Multi-GPU training defaults to DataParallel.
+## Fine-tune a pretrained denoiser
 
-Training writes logs to `stdout.txt`, numbered checkpoints to `checkpoints/`,
-and a periodic resume checkpoint to `checkpoints-meta/checkpoint.pth` under the
-work directory. Reusing that work directory resumes from the periodic checkpoint
-when it exists.
-
-## Generate candidates
-
-Generate five candidates for each of twenty test targets using a trained STM
-checkpoint:
+`main_finetune.py` loads a checkpoint's EMA weights, freezes the denoiser, and trains
+only `cond_encoder` and `cond_lin`. Use it for both training and evaluation:
 
 ```bash
-python sample.py \
-    --modality stm \
-    --ckpt /path/to/run/checkpoints/checkpoint_6.pth \
-    --config.model.pretrained_stm_encoder_path='' \
-    --split test --n-mols 20 --n-samples 5 \
-    --batch-mols 4 \
-    --out /path/to/samples
+python main_finetune.py --mode train --workdir RUN \
+    --config configs/qm9s_ters_frozen.py --config_original_qm9 configs/base_ters_qm9s.py
+python main_finetune.py --mode eval  --workdir RUN \
+    --config configs/qm9s_ters_frozen.py --config_original_qm9 configs/base_ters_qm9s.py
 ```
 
-Use an existing checkpoint filename and the architecture settings from its
-training run. The empty encoder-path override avoids requiring the separate
-pretraining file; the full model weights are restored from `--ckpt`. Sampling
-uses the checkpoint's exponential moving average (EMA) weights.
+| Config | Source checkpoint | Encoder |
+| --- | --- | --- |
+| `diffspectra_ters_frozen.py` | DiffSpectra (H/C/N/O/F, cut to H/C/N/O) | new |
+| `qm9s_ters_frozen.py` | DiffSpectra (H/C/N/O/F) | new |
+| `ters_frozen_p4.py` | a from-scratch planar TERS run | continued |
 
-For TERS, use `--modality ters` and omit the STM encoder override. For QM9S-TERS,
-also pass its configuration pair explicitly:
+The DiffSpectra checkpoint is expected at
+`DATA_ROOT/DiffSpectra/exp/allspectra_pretrained_specformer/checkpoints/checkpoint_40.pth`.
+To use another file, pass `--config.model.pretrained_denoiser_path=PATH`.
+
+- **Evaluate with `main_finetune.py` only.** The saved EMA covers only the trainable
+  weights. `main.py`, `sample.py` and `run_metrics` would apply it to the wrong weights
+  without an error.
+- **Match the source checkpoint.**
+  - Architecture: a mismatch fails when the weights are loaded.
+  - Position scale (`normalize_factors`, `spatial_cut_off`): this is not checked.
+  - Elements: the config's elements must be the first elements of the checkpoint's,
+    in the same order.
+
+## Generate and evaluate
 
 ```bash
-python sample.py \
-    --modality ters \
-    --config configs/diffspectra_ters_qm9s.py \
-    --config_original_qm9 configs/base_ters_qm9s.py \
-    --ckpt /path/to/qm9s-run/checkpoints/checkpoint_6.pth \
-    --split test --n-mols 20 --n-samples 5 \
-    --batch-mols 4 --out /path/to/qm9s-samples
+# Generate 5 candidates for each of 20 test targets
+python sample.py --modality ters --ckpt RUN/checkpoints/checkpoint_6.pth \
+    --split test --n-mols 20 --n-samples 5 --batch-mols 4 --out SAMPLES
+
+# Recovery: exact match and top-k similarity to the target
+python -m eval_sampled_mols.paper_metrics --cells test=SAMPLES/mols_test.pkl --ks 1 3 5
+
+# Quality: validity, stability, geometry, FCD, SNN, diversity
+python -m eval_sampled_mols.eval_cond --samples SAMPLES/processed_test.pkl
 ```
 
-`--batch-mols` limits the number of targets per generation batch; each target
-produces `--n-samples` candidates. Use `--split val` for validation targets and
-`--shuffle-cubes` to pair targets with other molecules' images as a null control.
+**`sample.py` options:**
 
-The output directory contains:
+- `--modality ters|stm` picks the default config pair. For QM9S-TERS or any other
+  dataset, pass `--config` and `--config_original_qm9`.
+- `--shuffle-cubes` pairs each target with another molecule's image, as a null control.
+- `--n-shards N --shard I` splits generation across processes. Combine the outputs with
+  `merge_shards.py`.
 
-| File | Contents |
+**Other evaluation commands:**
+
+- `python -m eval_sampled_mols.run_metrics --modality ters|stm --ckpt ...` generates
+  and scores in one command, for the standard planar TERS and STM configs.
+- `main.py --mode eval` scores checkpoints `config.eval.begin_ckpt` to `end_ckpt` with
+  DiffSpectra's metrics.
+
+[tools/README.md](tools/README.md) covers the scoring scripts, diagnostics and
+visualisation tools.
+
+## Extending
+
+### Add an encoder
+
+An encoder is an `nn.Module` that maps a batch of image cubes to one vector per molecule.
+Input shapes:
+
+- TERS: `(B, C, H, W)`, with C the number of spectral channels.
+- STM: `(B, Z, H, W)`, with Z the number of z-slices.
+
+The output must be `(B, config.model.nf)`.
+
+1. **Write the module** in `models/`. The existing encoders are references:
+   `ters_encoder.py` and `stm_encoder*.py`.
+2. **Build it** in the conditioning-encoder block of `models/dmt.py`
+   (`DMT.__init__`, after `_cond_kinds`). Select it with a config key, the way
+   `model.stm_encoder` selects `v1`, `v2` or `clip`. Pass `output_dim=hidden_dim`.
+3. **Declare every new config key** in the base config, for example `model.ters_encoder`
+   and `model.<name>_*`. Command-line flags can override a key but cannot create one.
+
+The encoder is stored under `cond_encoder.`, so `main_finetune.py` trains a new encoder
+with no changes.
+
+### Add a config
+
+Configs are Python files that import an existing config and override fields. Two
+existing configs show the pattern:
+
+- [diffspectra_ters_qm9s.py](configs/diffspectra_ters_qm9s.py) is a new dataset for
+  training from scratch.
+- [qm9s_ters_frozen.py](configs/qm9s_ters_frozen.py) is the same dataset for
+  fine-tuning.
+
+**For a new dataset, set:**
+
+| Field | Requirement |
 | --- | --- |
-| `samples_<split>.json` | Per-target recovery results and summary metrics. |
-| `mols_<split>.pkl` | Target and generated RDKit molecules for similarity scoring. |
-| `processed_<split>.pkl` | Generated atom, bond, and coordinate data for quality metrics. |
-| `geometry_<split>.pkl` | Geometry and image projections for visualization; omitted with `--no-geometry`. |
+| `data.root`, `data.graph_root` | HDF5 and graph directories. Set them in the auxiliary config too. |
+| `data.info_name`, `data.atom_types` | An entry in `datasets/datasets_config.py`, and its element count. |
+| `model.ters_in_channels` | The number of image channels. |
+| `training.n_iters`, `training.snapshot_freq` | `n_iters` must be a multiple of `snapshot_freq`. |
+| `eval.begin_ckpt`, `eval.end_ckpt` | Checkpoint numbers. Checkpoint N is saved at step N × `snapshot_freq`. |
+| `eval.num_samples` | At most the size of the test split. |
 
-Shuffled runs add `_shuf` before the file extension. Use `--save-sdf` for portable
-SDF exports. If `--out` is omitted, samples go to `generated/` beside the run's
-`checkpoints/` directory.
+**For fine-tuning, also set:**
 
-For independent generation jobs, use the same sampling settings and seed with
-`--n-shards N --shard I`, where `I` runs from `0` to `N-1`, and give each shard its
-own output directory. Merge the outputs before scoring:
+- `model.pretrained_denoiser_path`.
+- `model.load_pretrained_cond_encoder`: `False` for a new encoder, `True` to continue
+  the checkpoint's encoder.
+- `model.dropout = 0.0`.
+- The source checkpoint's architecture and position scale. The scale defaults to
+  DiffSpectra's, so change it only for checkpoints trained with another value.
 
-```bash
-python merge_shards.py \
-    --shards /path/to/shard0 /path/to/shard1 \
-    --split test --out /path/to/merged
-```
+## Conventions and limitations
 
-Add `--tag _shuf` when merging shuffled controls.
-
-## Evaluate results
-
-For standard STM or TERS configurations, generate and score a checkpoint in one
-command:
-
-```bash
-python -m eval_sampled_mols.run_metrics \
-    --modality stm \
-    --ckpt /path/to/run/checkpoints/checkpoint_6.pth \
-    --config.model.pretrained_stm_encoder_path='' \
-    --n-mols 20 --n-samples 10 --batch-mols 4 \
-    --out /path/to/evaluation \
-    --csv /path/to/evaluation/recovery.csv
-```
-
-This runs target-similarity scoring and molecular-quality scoring on matched test
-samples. Use `--cells test test_null val val_null` to include validation and
-shuffled-image controls. Each cell gets its own subdirectory under `--out`.
-`--dry-run` prints the commands without executing them. `--skip-sampling` reuses
-existing molecule files in those subdirectories; missing cells are still generated.
-Keep `--n-samples` at least as large as the largest requested `--ks` value.
-
-To score the five-candidate outputs from `sample.py` directly:
-
-```bash
-python -m eval_sampled_mols.paper_metrics \
-    --cells stm_test=/path/to/samples/mols_test.pkl \
-    --ks 1 3 5 --out /path/to/samples/recovery.csv
-
-python -m eval_sampled_mols.eval_cond \
-    --samples /path/to/samples/processed_test.pkl
-```
-
-Use these separate commands for custom configurations, including QM9S-TERS;
-`run_metrics` selects the standard STM or TERS configuration pair. The processed
-sample file records the auxiliary configuration used for reference metrics.
-
-- `paper_metrics` measures exact target recovery and top-k molecular similarity.
-- `eval_cond` measures chemical validity, valence/stability, predicted-bond geometry,
-  and distribution metrics such as FCD, SNN, and diversity.
-- `eval_saved_mols` and `eval_rmsd` score the separate molecule-list format produced
-  by `main.py --mode eval`. See the [tools guide](tools/README.md).
-
-Distance-inferred Metric-3D has known limitations for STM. Interpret it alongside
-predicted-bond valence and geometry checks.
-
-## Frozen-denoiser fine-tuning
-
-See [the frozen-denoiser guide](docs/frozen-denoiser.md) for source-compatible
-configs, CPU load/step/data validation, a fresh-workdir training example, and
-sampling with the matching EMA parameter set. DiffSpectra-to-STM vocabulary
-expansion is not supported.
-
-## Validation and development
-
-Run the preprocessing self-tests in the configured Python environment. They use
-synthetic records and require no external datasets:
-
-```bash
-python -m datasets.preprocess_ters --self-test
-python -m datasets.preprocess_stm --self-test
-```
-
-| Path | Purpose |
-| --- | --- |
-| `configs/`, `datasets/` | Experiment settings, HDF5 readers, graph preprocessing, and batching. |
-| `models/`, `diffusion/`, `sampling/` | Image encoders, molecular diffusion models, noise schedules, and generation. |
-| `main.py`, `run_lib.py`, `losses.py` | Training and evaluation entry point, loops, and losses. |
-| `sample.py`, `merge_shards.py` | Checkpoint-based generation and shard merging. |
-| `evaluation/`, `eval_sampled_mols/` | Reusable metric functions and evaluation commands. |
-| `tools/` | Diagnostics, analysis, and visualization. |
+- **Sampling is given each target's atom count.** The metrics measure structure recovery
+  with a known atom count.
+- **Position scale.** Positions are in Å (`normalize_factors = '1, 4, 4, 1'`), and
+  `spatial_cut_off = 2.0` Å², both as in DiffSpectra. The cutoff marks atom pairs within
+  1.41 Å as neighbours for one attention head. That covers C–H, double and aromatic bonds,
+  but not C–C single bonds. `3.61` would cover every bond. Fine-tuning from DiffSpectra
+  requires `2.0`.
+- **Elements.** A DiffSpectra checkpoint cannot be fine-tuned to STM's ten elements.

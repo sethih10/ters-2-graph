@@ -9,6 +9,9 @@ from torch_scatter import scatter
 import functools
 from .specformer import SpecFormer
 from .ters_encoder import TersEncoder
+from .stm_encoder import StmEncoder
+from .stm_encoder_v2 import StmEncoderV2
+from .stm_encoder_clip import StmCubeEncoder, load_pretrained_stm_cube_encoder
 
 
 def modulate(x, shift, scale):
@@ -257,18 +260,59 @@ class DMT(nn.Module):
                 nn.Linear(time_dim, time_dim)
             )
 
-        # Implement conditioning encoder.  Both branches honour the same contract -- a
-        # (B, output_dim) vector for cond_lin -- so nothing downstream of line 349 changes.
+        # Conditioning encoder; every branch must output (B, hidden_dim) for cond_lin.
         self.spectra_version = getattr(config.data, 'spectra_version', None)
-        self.cond_encoder_kind = 'ters' if config.data.name == 'TERS' else 'specformer'
+        _cond_kinds = {'TERS': 'ters', 'STM': 'stm'}
+        self.cond_encoder_kind = _cond_kinds.get(config.data.name, 'specformer')
 
         if self.cond_encoder_kind == 'ters':
-            # TERS conditions on an image cube, not 1-D spectra.  See docs/02-reuse-map.md 4.
             self.cond_encoder = TersEncoder(
                 in_channels=config.model.ters_in_channels,
                 filters=tuple(getattr(config.model, 'ters_filters', (64, 128, 256, 512))),
                 output_dim=hidden_dim,
+                pool_size=getattr(config.model, 'ters_pool_size', 1),
             )
+        elif self.cond_encoder_kind == 'stm':
+            stm_version = str(getattr(config.model, 'stm_encoder', 'v1')).lower()
+            if stm_version not in ('v1', 'v2', 'clip'):
+                raise ValueError(
+                    f"config.model.stm_encoder must be 'v1', 'v2' or 'clip', got "
+                    f'{stm_version!r}')
+            self.stm_version = stm_version
+            # Each version has its own config keys (stm_clip_*, stm_v2_*, stm_*); only
+            # stm_in_channels is shared, since values set for v1 do not fit the others.
+            if stm_version == 'clip':
+                self.cond_encoder = StmCubeEncoder(
+                    in_channels=getattr(config.model, 'stm_in_channels', 14),
+                    conv3d_channels=tuple(getattr(config.model, 'stm_clip_conv3d_channels',
+                                                  (4, 8, 16))),
+                    z_strides=tuple(getattr(config.model, 'stm_clip_z_strides', (2, 2, 1))),
+                    filters=tuple(getattr(config.model, 'stm_clip_filters',
+                                          (64, 128, 256))),
+                    output_dim=hidden_dim,
+                    pool_size=getattr(config.model, 'stm_clip_pool_size', 1),
+                )
+            elif stm_version == 'v2':
+                self.cond_encoder = StmEncoderV2(
+                    in_channels=getattr(config.model, 'stm_in_channels', 14),
+                    stem_channels=getattr(config.model, 'stm_v2_stem_channels', 16),
+                    stem_stride=getattr(config.model, 'stm_v2_stem_stride', 2),
+                    conv3d_channels=tuple(getattr(config.model, 'stm_v2_conv3d_channels',
+                                                  (48, 96, 192))),
+                    block_depth=getattr(config.model, 'stm_v2_block_depth', 2),
+                    filters=tuple(getattr(config.model, 'stm_v2_filters', (128, 256))),
+                    output_dim=hidden_dim,
+                    pool_size=getattr(config.model, 'stm_v2_pool_size', 2),
+                )
+            else:
+                self.cond_encoder = StmEncoder(
+                    in_channels=getattr(config.model, 'stm_in_channels', 14),
+                    conv3d_channels=tuple(getattr(config.model, 'stm_conv3d_channels',
+                                                  (4, 8, 16))),
+                    filters=tuple(getattr(config.model, 'stm_filters', (64, 128, 256))),
+                    output_dim=hidden_dim,
+                    pool_size=getattr(config.model, 'stm_pool_size', 1),
+                )
         else:
             self.cond_encoder = SpecFormer(patch_len=config.model.patch_len, stride=config.model.stride, output_dim=hidden_dim, spectra_version=config.data.spectra_version)
 
@@ -279,8 +323,6 @@ class DMT(nn.Module):
 
         if self.cond_encoder_kind == 'ters':
             if specformer_ckpt:
-                # These weights cannot fit a conv trunk. Loading would match zero keys and
-                # silently train from scratch, so refuse instead of printing a warning.
                 raise ValueError(
                     'config.model.pretrained_specformer_path is set but the TERS encoder is '
                     'a conv trunk, not a SpecFormer -- no key would match. Use '
@@ -291,6 +333,27 @@ class DMT(nn.Module):
                 self.load_pretrained_ters_encoder(ters_ckpt)
             else:
                 print("Train TersEncoder from scratch")
+        elif self.cond_encoder_kind == 'stm':
+            if specformer_ckpt:
+                raise ValueError(
+                    'config.model.pretrained_specformer_path is set but the STM encoder is '
+                    'a 3D conv trunk, not a SpecFormer -- no key would match. Clear it to '
+                    'train from scratch.')
+            stm_ckpt = getattr(config.model, 'pretrained_stm_encoder_path', '')
+            if stm_ckpt and self.stm_version != 'clip':
+                raise ValueError(
+                    f'config.model.pretrained_stm_encoder_path is set but '
+                    f'config.model.stm_encoder is {self.stm_version!r}. Those weights belong '
+                    f'to StmCubeEncoder; {self.stm_version} has a different 3D stem, so only '
+                    f'its 2D trunk would load. Set '
+                    f"config.model.stm_encoder='clip', or clear the checkpoint path.")
+            if stm_ckpt:
+                print('Load pretrained StmCubeEncoder (contrastive)')
+                load_pretrained_stm_cube_encoder(self.cond_encoder, stm_ckpt)
+            else:
+                print(f"Train {type(self.cond_encoder).__name__} from scratch "
+                      f"({sum(p.numel() for p in self.cond_encoder.parameters())/1e6:.2f}M "
+                      f"params)")
         elif specformer_ckpt:
             print("Load pretrained SpecFormer")
             self.load_pretrained_specformer(specformer_ckpt)
@@ -298,15 +361,11 @@ class DMT(nn.Module):
             print("Train SpecFormer from scratch")
 
     def load_pretrained_ters_encoder(self, ckpt_path):
-        """Load an MT AttentionUNet checkpoint into the ported encoder trunk.
+        """Load encoder weights from an ``AttentionUNet`` checkpoint into ``TersEncoder``.
 
-        Only the trunk can transfer: MT's decoder, attention gates and output conv have no
-        counterpart here, and the pooling head is new. Unlike
-        ``load_pretrained_specformer``, a zero-key match **raises** -- silently training from
-        scratch while the log says "Load pretrained" is the failure mode worth preventing.
-
-        Untested against a real MT checkpoint: the MT repo is not mounted here (D-3), so the
-        prefix list below is from docs/02-reuse-map.md 4 and may need extending.
+        Tensors are matched by name and shape; unmatched ones, such as the pooling head, keep
+        their initialisation. Raises ``ValueError`` if none match. Not yet tested on a real
+        checkpoint.
         """
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)

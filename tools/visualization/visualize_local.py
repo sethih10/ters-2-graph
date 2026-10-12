@@ -1,0 +1,106 @@
+"""Render each target next to its generated candidates, ordered by score.
+
+Writes one PNG and one SVG grid per split.
+"""
+import argparse, os, pickle, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from rdkit import Chem, RDLogger
+from rdkit.Chem import Draw, AllChem
+from rdkit.Chem.Draw import rdMolDraw2D
+RDLogger.DisableLog('rdApp.*')
+
+
+def prep(mol):
+    """Heavy-atom depiction with 2D coords, matching how the scores were computed."""
+    if mol is None:
+        return None
+    try:
+        m = Chem.Mol(mol)
+        Chem.SanitizeMol(m)
+        m = Chem.RemoveHs(m)
+        AllChem.Compute2DCoords(m)
+        return m
+    except Exception:
+        return None
+
+
+def grid_for_split(rows, path_png, path_svg, sub=(380, 300)):
+    mols, legends = [], []
+    for rank, r in enumerate(rows):
+        t = prep(r['truth'])
+        mols.append(t)
+        legends.append(f"#{r['ds_index']}  TRUTH  {r['truth_formula']}")
+        for s in r['samples']:
+            g = prep(s['mol'])
+            mols.append(g)
+            if g is None:
+                legends.append(f"sample {s['i']}  unparseable")
+            else:
+                tag = ' *EXACT*' if s['exact'] else (' [formula]' if s['formula_match'] else '')
+                legends.append(f"sample {s['i']}  Tan {s['tanimoto']:.2f}{tag}")
+    ncol = 1 + len(rows[0]['samples'])
+
+    img = Draw.MolsToGridImage(mols, molsPerRow=ncol, subImgSize=sub,
+                               legends=legends, useSVG=False, returnPNG=False)
+    with open(path_png, 'wb') as f:
+        if hasattr(img, 'save'):
+            img.save(f)                      # PIL image
+        else:
+            f.write(img.data if hasattr(img, 'data') else img)
+    svg = Draw.MolsToGridImage(mols, molsPerRow=ncol, subImgSize=sub,
+                               legends=legends, useSVG=True)
+    with open(path_svg, 'w') as f:
+        f.write(svg.data if hasattr(svg, 'data') else svg)
+    return len(mols), ncol
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--dir', required=True, help='a <workdir>/generated directory')
+    ap.add_argument('--splits', nargs='+', default=['test', 'val'])
+    args = ap.parse_args()
+    figdir = os.path.join(args.dir, 'figures')
+    os.makedirs(figdir, exist_ok=True)
+
+    for split in args.splits:
+        with open(os.path.join(args.dir, f'mols_{split}.pkl'), 'rb') as f:
+            d = pickle.load(f)
+        n_samp = d['n_samples']
+        rows = []
+        for e in d['results']:                     # already sorted best -> worst
+            mi = e['mol']
+            gt = prep(d['truth'][mi])
+            samples = []
+            for si in range(n_samp):
+                g = d['generated'][mi * n_samp + si]
+                gp = prep(g)
+                gt_smi = Chem.MolToSmiles(gt) if gt else None
+                smi = Chem.MolToSmiles(gp) if gp else None
+                tan = 0.0
+                if gp is not None and gt is not None:
+                    fa = AllChem.GetMorganFingerprintAsBitVect(gt, 2, nBits=2048)
+                    fb = AllChem.GetMorganFingerprintAsBitVect(gp, 2, nBits=2048)
+                    from rdkit import DataStructs
+                    tan = float(DataStructs.TanimotoSimilarity(fa, fb))
+                from rdkit.Chem.rdMolDescriptors import CalcMolFormula
+                samples.append({'i': si, 'mol': g, 'tanimoto': tan,
+                                'exact': bool(smi and smi == gt_smi),
+                                'formula_match': bool(gp is not None and gt is not None and
+                                                      CalcMolFormula(gp) == CalcMolFormula(gt))})
+            from rdkit.Chem.rdMolDescriptors import CalcMolFormula
+            rows.append({'ds_index': e['ds_index'], 'truth': d['truth'][mi],
+                         'truth_formula': CalcMolFormula(gt) if gt else '?',
+                         'samples': samples})
+        png = os.path.join(figdir, f'{split}_truth_vs_samples.png')
+        svg = os.path.join(figdir, f'{split}_truth_vs_samples.svg')
+        n, ncol = grid_for_split(rows, png, svg)
+        print(f'{split}: {len(rows)} rows x {ncol} cols ({n} depictions) -> {png}')
+
+    print(f'\nfigures in {figdir}:')
+    for f in sorted(os.listdir(figdir)):
+        print(f'  {f}  ({os.path.getsize(os.path.join(figdir, f))/1024:.0f} KB)')
+
+
+if __name__ == '__main__':
+    main()

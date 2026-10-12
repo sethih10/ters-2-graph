@@ -1,32 +1,8 @@
-"""Phase 3 -- conditioning encoder for TERS image cubes.
+"""Convolutional encoder for TERS image cubes.
 
-Drop-in replacement for ``SpecFormer`` as ``DMT.cond_encoder``.  Same contract, so nothing
-in the denoiser moves: ``(B, C, H, W) -> (B, output_dim)``, consumed by ``cond_lin`` at
-models/dmt.py:348-349.
-
-Provenance (see docs/02-reuse-map.md 4, components 11 and 12):
-  * encoder trunk  -- ADAPT of Multimodal-ters/src/models/models.py:84-133 (AttentionUNet):
-                      keep the 1x1 stem and the ResBlock+MaxPool ladder, drop the decoder
-                      ladder, the attention gates, the final resblock and the output conv
-  * ``ResBlock``   -- ADAPT of Multimodal-ters/src/models/layers.py:6-34, with
-                      ``BatchNorm2d`` -> ``GroupNorm`` (see the note on that below)
-  * ``out_norm`` + ``reset_parameters()`` -- REUSE of the interface SpecFormer exposes at
-                      models/specformer.py:67 and :70-73, so swapping the two encoders stays
-                      a one-line change
-  * pooling head, small-input guard -- NEW
-
-.. warning::
-   **The MT repository is not mounted here (docs/05-progress-log.md D-3), so the two ADAPT
-   rows above were reconstructed from the specification recorded in docs/02-reuse-map.md 4 --
-   filter widths, kernel sizes, stem width and ladder shape -- not by reading MT's source.**
-   The shapes and the training behaviour are verified; exact layer-for-layer correspondence
-   with MT is not.  When MT is available, diff this against ``models.py:84-133`` and
-   ``layers.py:6-34`` before loading any MT checkpoint into it.
-
-Checked first and rejected: ``models/layers.py`` in this repo has no 2D convolution at all --
-it is entirely graph message passing plus Gaussian-basis and sinusoidal embeddings.
-``Flatten_Head`` (models/specformer.py:428) is a flatten-plus-linear for token sequences, not
-a spatial pooling head.  The conv stack has to come from MT.
+Maps a cube ``(B, C, H, W)`` to ``(B, output_dim)``; used as ``DMT.cond_encoder``. Submodule
+names and shapes follow the encoder path of ``AttentionUNet`` so that
+``DMT.load_pretrained_ters_encoder`` can load its weights.
 """
 
 import torch
@@ -34,12 +10,7 @@ from torch import nn
 
 
 def _groups_for(channels, preferred=8):
-    """Largest group count <= ``preferred`` that divides ``channels``.
-
-    ``GroupNorm`` requires ``channels % num_groups == 0``.  The default filter widths
-    (64/128/256/512) are all divisible by 8, but the stem width is configurable, so pick a
-    legal value rather than crashing on an odd channel count.
-    """
+    """Return the largest group count <= ``preferred`` that divides ``channels``."""
     for g in range(min(preferred, channels), 0, -1):
         if channels % g == 0:
             return g
@@ -47,27 +18,20 @@ def _groups_for(channels, preferred=8):
 
 
 class ResBlock(nn.Module):
-    """ADAPT of Multimodal-ters/src/models/layers.py:6-34 (see the module warning).
+    """Residual block: conv-norm-ReLU, conv-norm, skip connection, ReLU.
 
-    **``BatchNorm2d`` -> ``GroupNorm`` is a correctness fix, not tuning.** ``create_model``
-    wraps the model in ``nn.DataParallel`` (models/utils.py:27), which computes BatchNorm
-    statistics *per replica*.  At the planned ``batch_size=4`` across two GPUs that is
-    BatchNorm over two samples, whose running statistics are noise.  GroupNorm does not
-    depend on the batch axis at all, so it is unaffected by both the small batch and the
-    replica split.
+    GroupNorm rather than BatchNorm because ``nn.DataParallel`` splits small batches across
+    replicas. Parameter names are checkpoint keys; do not rename them.
     """
 
     def __init__(self, in_channels, out_channels, kernel_size=3, n_groups=8):
         super().__init__()
-        padding = kernel_size // 2                      # 'same' -- the ladder downsamples
-                                                        # via MaxPool, not via the convs
+        padding = kernel_size // 2
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding)
         self.norm1 = nn.GroupNorm(_groups_for(out_channels, n_groups), out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size, padding=padding)
         self.norm2 = nn.GroupNorm(_groups_for(out_channels, n_groups), out_channels)
         self.act = nn.ReLU(inplace=True)
-        # Projection on the skip path only when the width changes, so a same-width block
-        # stays a true identity shortcut.
         self.skip = (nn.Conv2d(in_channels, out_channels, kernel_size=1)
                      if in_channels != out_channels else nn.Identity())
 
@@ -78,32 +42,35 @@ class ResBlock(nn.Module):
 
 
 class TersEncoder(nn.Module):
-    """TERS cube -> a single conditioning vector.
+    """Encode a TERS cube ``(B, C, H, W)`` into ``(B, output_dim)``.
+
+    A 1x1 stem, residual stages with max pooling and a pooled linear head.
 
     Parameters
     ----------
     in_channels : int
-        Spectral channels in the cube.  Comes from ``TersGraphDataset.in_channels``; with
-        the ``channels_100`` decision (docs/05-progress-log.md) that is 100, not 400.
+        Number of spectral channels; must match ``TersGraphDataset.in_channels``.
     output_dim : int
-        Must equal ``config.model.nf`` -- ``cond_lin`` is ``Linear(hidden_dim, time_dim)``
-        (models/dmt.py:262).
+        Embedding size; must equal ``config.model.nf``.
+    pool_size : int
+        Spatial grid size before the head; 1 is global average pooling.
     """
 
     def __init__(self, in_channels=100, filters=(64, 128, 256, 512),
-                 kernel_size=(3, 3, 3, 3), output_dim=256, n_groups=8):
+                 kernel_size=(3, 3, 3, 3), output_dim=256, n_groups=8, pool_size=1):
         super().__init__()
         if len(kernel_size) != len(filters):
             raise ValueError(
                 f'filters and kernel_size must be the same length, '
                 f'got {len(filters)} and {len(kernel_size)}')
 
+        if pool_size < 1:
+            raise ValueError(f'pool_size must be >= 1, got {pool_size}')
+
         self.in_channels = in_channels
         self.output_dim = output_dim
+        self.pool_size = pool_size
 
-        # 1x1 stem: mixes the spectral channels at full spatial resolution before any
-        # spatial convolution.  With 100 input channels this is where most of the input
-        # dimensionality is absorbed.
         self.stem = nn.Conv2d(in_channels, filters[0], kernel_size=1)
 
         widths = [filters[0]] + list(filters)
@@ -114,20 +81,16 @@ class TersEncoder(nn.Module):
         self.pool = nn.MaxPool2d(2, 2)
 
         self.head = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),          # any H,W -> 1x1, so cube size need not be known
+            nn.AdaptiveAvgPool2d(pool_size),
             nn.Flatten(),
-            nn.Linear(filters[-1], output_dim),
+            nn.Linear(filters[-1] * pool_size * pool_size, output_dim),
         )
-        # Mirrors SpecFormer.out_norm (models/specformer.py:67).  Keep it: cond_lin was
-        # initialised for a LayerNorm-scaled input, and handing it raw pooled activations
-        # instead changes the scale of the conditioning signal added to time_emb at
-        # models/dmt.py:354.
         self.out_norm = nn.LayerNorm(output_dim)
 
         self.reset_parameters()
 
     def reset_parameters(self):
-        """Matches the interface SpecFormer exposes at models/specformer.py:70-73."""
+        """Initialise weights."""
         for m in self.modules():
             if isinstance(m, (nn.Conv2d, nn.Linear)):
                 nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
@@ -151,10 +114,7 @@ class TersEncoder(nn.Module):
         x = self.stem(x)
         for block in self.blocks:
             x = block(x)
-            # The real cube size is not known until the HDF5 is read (D-1), and four
-            # unconditional 2x2 pools would take anything below 16x16 down to a 0-sized
-            # dimension.  Stop pooling once there is nothing left to halve; AdaptiveAvgPool2d
-            # in the head handles whatever spatial size survives.
+            # Stop pooling once a side is below 2, so small inputs do not shrink to size 0.
             if min(x.shape[-2:]) >= 2:
                 x = self.pool(x)
         return self.out_norm(self.head(x))

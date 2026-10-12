@@ -1,24 +1,10 @@
-"""Phase 2 -- pair the TERS image cubes in the HDF5 with the Phase-1 graph sidecar.
+"""Pair TERS image cubes (HDF5) with the graph sidecar written by ``preprocess_ters.py``.
 
-``preprocess_ters.py`` wrote one record per molecule carrying the graph fields and an
-``h5_index`` back-pointer.  This module joins the two: the sidecar is small enough to hold
-in RAM, the image cubes are read from the HDF5 one at a time.
-
-Provenance (see docs/02-reuse-map.md 5, 7):
-  * ``NormalizeVectorized``  -- ADAPT of Multimodal-ters/src/transforms/normalize.py:19-35
-                                (per-channel mean/std over the H,W axes + zero-std guard)
-  * ``TersGraphDataset``     -- ADAPT of Multimodal-ters/src/datasets/ters_hdf5.py:24-134
-                                (key selection, permute, transform hook; changed: lazy file
-                                open for fork-safety, returns a PyG ``Data``, graph fields
-                                come from the sidecar rather than the unused ``targets``)
-
-``CollateTers`` lives in ``build_dataset.py`` beside the ``CollateSpectra`` it subclasses;
-keeping it there means this module imports nothing from ``build_dataset`` at module level
-and there is no import cycle.
+Each sample is a PyG ``Data`` with the sidecar's graph fields and the cube as ``(C, H, W)``;
+batches are collated by ``build_dataset.CollateTers``.
 
 Usage
 -----
-    # standalone smoke test against a real split (no training loop involved)
     python -m datasets.ters_dataset --h5 .../val.h5 --graphs datasets/ters/graphs_val.pt
 """
 
@@ -29,14 +15,9 @@ from torch_geometric.data import Data
 
 
 class NormalizeVectorized:
-    """ADAPT of Multimodal-ters/src/transforms/normalize.py:19-35.
+    """Standardise each channel of a ``(C, H, W)`` cube over its spatial axes.
 
-    Per-channel standardisation over the spatial axes of a ``(C, H, W)`` cube.
-
-    **This is not optional.** Raw cube values run 0 to ~2556 (docs/02-reuse-map.md 5) and
-    ``EdgeComSpectraTransform`` will not touch them -- it log-normalises only ``ir``/``uv``/
-    ``raman``, each guarded by ``hasattr`` (datasets/build_dataset.py:145-151).  Skipping
-    this is the most likely cause of NaN in the first hundred training steps.
+    Channels with std below ``eps`` are only mean-centred.
     """
 
     def __init__(self, eps=1e-6):
@@ -45,37 +26,54 @@ class NormalizeVectorized:
     def __call__(self, cube):
         mean = cube.mean(dim=(1, 2), keepdim=True)
         std = cube.std(dim=(1, 2), keepdim=True)
-        # Zero-std guard.  TERS cubes contain genuinely dead channels, and dividing by a
-        # near-zero std amplifies float32 cancellation noise (a constant channel's mean is
-        # only exact to ~1e-9) into O(0.1) garbage.  Substituting 1.0 leaves such a channel
-        # at ~0 instead.
-        std = torch.where(std < self.eps, torch.ones_like(std), std)
+        std =torch.where(std < self.eps, torch.ones_like(std), std)
         return (cube - mean) / std
 
 
-class TersGraphDataset(Dataset):
-    """One TERS split: graph targets from the sidecar, conditioning cube from the HDF5.
+class AddCubeNoise:
+    """Add i.i.d. Gaussian noise to a normalised cube.
 
-    Deliberately *not* built on ``QM9SDataset``.  That class subclasses PyG
-    ``InMemoryDataset``, which ``torch.load``s the whole corpus into RAM
-    (datasets/qm9s_dataset.py:153), and wraps ``__getitem__`` in ``@lru_cache(maxsize=16)``
-    (line 357) -- 16 cached TERS samples is ~1.7 GB *per worker*.  Both disqualifying.
-    See docs/02-reuse-map.md 7.
+    Apply after normalisation, so ``std`` is a fraction of the per-channel signal std. The
+    noise is seeded from ``seed`` and ``index``, so a molecule gets the same noise on every read.
     """
 
+    def __init__(self, std, seed=0):
+        self.std = float(std)
+        self.seed = int(seed)
+
+    def __call__(self, cube, index):
+        if self.std <= 0.0:
+            return cube
+        gen =torch.Generator().manual_seed((self.seed * 1000003 + int(index)) & 0x7FFFFFFF)
+        noise = torch.empty_like(cube).normal_(mean=0.0, std=self.std, generator=gen)
+        return cube + noise
+
+    def __repr__(self):
+        return f'AddCubeNoise(std={self.std}, seed={self.seed})'
+
+
+class TersGraphDataset(Dataset):
+    """One TERS split: graph targets from the sidecar, conditioning cube from the HDF5."""
+
+    cube_attr = 'ters'          # Data attribute that holds the cube
+
     def __init__(self, h5_path, graphs_path, channels_key='channels_100',
-                 transform=None, normalize=True, load_cubes=True):
+                 transform=None, normalize=True, load_cubes=True, noise=None):
         import h5py
 
         self.h5_path = h5_path
         self.graphs_path = graphs_path
         self.channels_key = channels_key
         self.transform = transform
-        self.normalize = NormalizeVectorized() if normalize else None
+        if callable(normalize):
+            self.normalize = normalize
+        else:
+            self.normalize = NormalizeVectorized() if normalize else None
+        # Callable (cube, index) -> cube applied after normalisation, e.g. AddCubeNoise.
+        self.noise = noise
         self.load_cubes = load_cubes
 
-        # The sidecar holds RDKit Mol objects under 'rdmol', so it is not a weights-only
-        # payload.  torch>=2.6 defaults weights_only=True and would refuse to load it.
+        # The sidecar holds RDKit Mols, which weights_only=True cannot load.
         self.graphs = torch.load(graphs_path, weights_only=False)
         if not self.graphs:
             raise ValueError(f'{graphs_path} contains no records')
@@ -83,16 +81,11 @@ class TersGraphDataset(Dataset):
         self._hf = None
 
         if not load_cubes:
-            # Graph-only mode. run_lib.py:339-341 walks the whole dataset purely to collect
-            # `.rdmol` for the MOSES reference sets; reading a cube per molecule there is
-            # tens of GB of I/O for data that is immediately discarded. In this mode the
-            # HDF5 is never opened, so the sidecar alone is enough to construct the dataset.
             self.cube_shape = None
             self.in_channels = None
             return
 
-        # Validate the cube key once here, in the parent process, rather than letting it
-        # fail inside a DataLoader worker where the traceback is far less readable.
+        # Validate here so errors surface outside DataLoader workers.
         with h5py.File(h5_path, 'r') as f:
             if channels_key not in f:
                 raise KeyError(
@@ -104,7 +97,7 @@ class TersGraphDataset(Dataset):
             raise ValueError(
                 f'{channels_key} has shape {shape}; expected 4 dims (N, H, W, C)')
         self.cube_shape = tuple(shape[1:])          # (H, W, C) as stored
-        self.in_channels = int(shape[3])            # feeds TersEncoder(in_channels=)
+        self.in_channels = int(shape[3])
 
         worst = max(int(g['h5_index']) for g in self.graphs)
         if worst >= shape[0]:
@@ -120,27 +113,25 @@ class TersGraphDataset(Dataset):
         data = Data(**g)
 
         if not self.load_cubes:
-            # No `ters` attribute is set, so CollateTers would raise on this dataset -- which
-            # is correct: a graph-only dataset must never be handed to a training loader.
+            # Graph-only sample: no cube, so it cannot go through CollateTers.
             return data if self.transform is None else self.transform(data)
 
-        # Opened on first touch, so the handle is created *inside* the worker.  An h5py
-        # handle inherited across fork() is not safe to read from.
+        # Open lazily, inside the worker: h5py handles are not fork-safe.
         if self._hf is None:
             import h5py
             self._hf = h5py.File(self.h5_path, 'r')
 
         cube = self._hf[self.channels_key][int(g['h5_index'])]      # (H, W, C)
-        # num_nodes is inferred by PyG from pos, which EdgeComSpectraTransform relies on at
-        # datasets/build_dataset.py:130.  Setting pos (done in the sidecar) is sufficient.
         ters = torch.from_numpy(np.asarray(cube)).float().permute(2, 0, 1).contiguous()
-        data.ters = ters if self.normalize is None else self.normalize(ters)
+        cube_t = ters if self.normalize is None else self.normalize(ters)
+        if self.noise is not None:
+            cube_t = self.noise(cube_t, int(g['h5_index']))
+        setattr(data, self.cube_attr, cube_t)
 
         return data if self.transform is None else self.transform(data)
 
     def __getstate__(self):
-        # Never pickle a live HDF5 handle to a worker (spawn start method, or a parent that
-        # already read a sample before the loader forked).
+        # Never pickle a live HDF5 handle.
         state = self.__dict__.copy()
         state['_hf'] = None
         return state

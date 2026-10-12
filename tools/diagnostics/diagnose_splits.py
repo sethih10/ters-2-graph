@@ -1,0 +1,105 @@
+"""Matched vs shuffled-cube loss on the val and test splits at fixed noise levels.
+
+Also prints the test loss relative to the val loss.
+
+Usage
+-----
+    python -m tools.diagnostics.diagnose_splits --ckpt CKPT [--config.model.nf=512]
+"""
+import argparse, random
+import numpy as np
+import torch
+
+from datasets import get_dataset, get_dataloader
+from models.ema import ExponentialMovingAverage
+from models import create_model
+import losses
+from utils import get_data_scaler
+from diffusion import NoiseScheduleVP
+import sys
+
+from absl import flags
+from ml_collections import config_flags
+from tools.diagnostics.diagnose_progress import FixedT
+
+
+def main():
+    ap = argparse.ArgumentParser(allow_abbrev=False)
+    ap.add_argument('--ckpt', required=True)
+    ap.add_argument('--config', help='Python config file; override fields with --config.FIELD=VALUE', default='configs/diffspectra_ters.py')
+    ap.add_argument('--config_original_qm9', '--config-qm9', dest='config_qm9', default='configs/base_ters.py')
+    ap.add_argument('--batches', type=int, default=2)
+    ap.add_argument('--seeds', type=int, default=3)
+    args, config_overrides = ap.parse_known_args()
+
+    config_argv = [sys.argv[0], f'--config={args.config}',
+                   f'--config_original_qm9={args.config_qm9}', *config_overrides]
+    config_values = flags.FlagValues()
+    config_flags.DEFINE_config_file('config', flag_values=config_values,
+                                    sys_argv=config_argv)
+    config_flags.DEFINE_config_file('config_original_qm9', flag_values=config_values,
+                                    sys_argv=config_argv)
+    try:
+        config_values(config_argv)
+    except flags.Error as exc:
+        ap.error(str(exc))
+    config = config_values.config; config.device = torch.device('cuda')
+    cfg_q = config_values.config_original_qm9
+    _, _, val_ds, test_ds, _ = get_dataset(config)
+    get_dataset(cfg_q)
+
+    noise_scheduler = NoiseScheduleVP(config.sde.schedule,
+                                      continuous_beta_0=config.sde.continuous_beta_0,
+                                      continuous_beta_1=config.sde.continuous_beta_1)
+    loss_fn = losses.get_sde_graph_loss_fn(noise_scheduler, False, get_data_scaler(config), config)
+
+    model = create_model(config)
+    ema = ExponentialMovingAverage(model.parameters(), decay=config.model.ema_decay)
+    ck = torch.load(args.ckpt, map_location=config.device, weights_only=False)
+    model.load_state_dict(ck['model'], strict=True)
+    ema.load_state_dict(ck['ema']); ema.copy_to(model.parameters()); model.eval()
+    print(f"checkpoint step {int(ck['step'])} (EMA)\n")
+
+    t_grid = [0.05, 0.15, 0.30, 0.50, 0.70, 0.90]
+    table = {}
+    for name, ds in (('val', val_ds), ('test', test_ds)):
+        # get_dataloader returns (train, val, test) loaders; only the middle one is used.
+        _, loader, _ = get_dataloader(ds, ds, ds, config)
+        it = iter(loader)
+        batches = [next(it) for _ in range(args.batches)]
+        print(f'{name}: {len(ds)} molecules, {len(batches)} batches of '
+              f'{batches[0]["positions"].shape[0]}')
+        per_t = {}
+        for tv in t_grid:
+            m, s = [], []
+            for bi, b in enumerate(batches):
+                n = b['positions'].shape[0]
+                perm = torch.roll(torch.arange(n), 1)
+                for sd in range(args.seeds):
+                    bb = dict(b); bb['context'] = b['context'][perm].clone()
+                    torch.manual_seed(sd + 77 * bi); random.seed(sd + 77 * bi)
+                    with FixedT(tv), torch.no_grad():
+                        m.append(float(loss_fn(model, b)))
+                    torch.manual_seed(sd + 77 * bi); random.seed(sd + 77 * bi)
+                    with FixedT(tv), torch.no_grad():
+                        s.append(float(loss_fn(model, bb)))
+            m, s = np.array(m), np.array(s)
+            per_t[tv] = (m.mean(), s.mean(), (s - m).mean())
+        table[name] = per_t
+
+    print('\n' + '=' * 92)
+    print('Validation vs test: loss and mismatched-cube penalty at fixed noise')
+    print('=' * 92)
+    print(f"{'t':>6}{'val loss':>11}{'test loss':>11}{'val pen':>10}{'test pen':>10}"
+          f"{'val %':>9}{'test %':>9}{'gap':>9}")
+    for tv in t_grid:
+        v, te = table['val'][tv], table['test'][tv]
+        print(f'{tv:6.2f}{v[0]:11.4f}{te[0]:11.4f}{v[2]:+10.4f}{te[2]:+10.4f}'
+              f'{100*v[2]/v[0]:+9.1f}{100*te[2]/te[0]:+9.1f}{100*(te[0]-v[0])/v[0]:+9.2f}')
+    print('=' * 92)
+    print('gap = test loss relative to val loss at that noise level, in %; a large positive')
+    print('gap indicates overfitting, which training does not report (it logs no validation loss).')
+
+
+if __name__ == '__main__':
+    main()

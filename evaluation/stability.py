@@ -50,6 +50,10 @@ def check_stability(positions, atom_type, dataset_info, debug=False):
             elif 'Geom' in dataset_info['name']:
                 order = geom_predictor(
                     (atom_decoder[pair[0]], atom_decoder[pair[1]]), dist)
+            # check_exists=True scores an untabulated pair as no bond instead of raising KeyError.
+            # Margins are QM9-tuned and uncalibrated for Si, P, S, Cl, Br; prefer the 2D metric.
+            elif dataset_info['name'] in ('TERS', 'STM'):
+                order = get_bond_order(atom1, atom2, dist, check_exists=True)
             else:
                 raise ValueError('Fail to get dataset bond info.')
             nr_bonds[i] += order
@@ -119,7 +123,8 @@ def check_2D_stability(positions, atom_types, formal_charges, edge_types, datase
             order = edge_types[src, dst]
             mol.AddBond(src.item(), dst.item(), bond_list[int(order)])
 
-    if dataset_name not in ['GeomDrug', 'QM9']:
+    # `allowed_fc_bonds` covers every element and formal-charge state of the TERS and STM corpora.
+    if dataset_name not in ['GeomDrug', 'QM9', 'TERS', 'STM']:
         return 0, 0, atom_num, mol
 
     # kekulize mol and iterate bonds for stability

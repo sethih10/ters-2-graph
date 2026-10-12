@@ -1,47 +1,22 @@
-"""Phase 1 -- derive molecular graph targets from TERS HDF5 geometry.
+"""Build graph sidecars from the atom geometry in TERS HDF5 files.
 
-The TERS HDF5 stores atomic numbers and Cartesian coordinates but no connectivity.
-DMT's targets need a bond-order matrix and every metric in ``evaluation/`` needs an
-RDKit ``Mol``.  This script builds both offline into a small sidecar per split; the
-105 MB image cubes stay in the HDF5 and are never copied.
-
-Provenance (see docs/02-reuse-map.md):
-  * ``build_xyz_block``        -- ADAPT of Multimodal-ters/scripts/npz_to_hdf5_converter.py:90-95
-                                  (same producer, handed to Chem.MolFromXYZBlock instead of
-                                  the rasteriser)
-  * ``ATOMIC_SYMBOLS``         -- REUSE of Multimodal-ters/src/datasets/ters_image_to_image_sh.py:35-46
-  * ``covalent_bond_fallback`` -- ADAPT of Multimodal-ters/src/datasets/ters_image_to_image_sh.py:160-174
-                                  (the working copy; NOT src/utils/dataset_utils.py:5-30, which
-                                  raises NameError on an undefined ``covalent_radii_new``)
-  * ``encode_graph``           -- REUSE of the encoding convention in
-                                  datasets/qm9s_dataset.py:206-260 (types/bonds dicts, both edge
-                                  directions, ``(row * N + col)`` sort)
-  * orchestration + stats      -- NEW
+Infers bonds with RDKit, kekulizes, and writes one ``graphs_<split>.pt`` per split: a list of
+QM9S-style graph records, each with an ``h5_index`` pointing at its image cube.
 
 Usage
 -----
-    # 0. prove the environment and the port work -- needs no data at all
     python -m datasets.preprocess_ters --self-test
-
-    # 1. confirm the HDF5 layout (key names are probed, not assumed)
     python -m datasets.preprocess_ters --h5 .../train.h5 --inspect
-
-    # 2. build all three sidecars + the Phase 0 geometry rows
-    python -m datasets.preprocess_ters \
-        --data-dir /scratch/phys/sin/sethih1/Multimodal_TERS/planar_hdf5_0.05 \
+    python -m datasets.preprocess_ters \\
+        --data-dir $DATA_ROOT/planar_hdf5_0.5 \\
         --out-dir datasets/ters --stats
-
-    # ...or one split at a time
-    python -m datasets.preprocess_ters --h5 .../train.h5 \
+    python -m datasets.preprocess_ters --h5 .../train.h5 \\
         --out datasets/ters/graphs_train.pt --stats
-
-If the probe picks the wrong HDF5 datasets, pass ``--z-key`` / ``--pos-key`` rather than
-editing this file.  Run once; requires ``rdkit``.  ``ase`` is optional -- it is used only
-by the covalent-radius fallback, which falls back to vendored H/C/N/O radii without it.
+    python -m datasets.preprocess_ters --elements hcnof --h5 .../qm9s/train.h5 \\
+        --out <graph_root>/graphs_train.pt --stats
 """
 
 import argparse
-import math
 import json
 import os
 import os.path as osp
@@ -51,31 +26,27 @@ import numpy as np
 import torch
 
 
-# --- REUSE: Multimodal-ters/src/datasets/ters_image_to_image_sh.py:35-46 -----------------
-# Only H/C/N/O are expected in this dataset (docs/04-phase0-measurements.md), but keep the
-# wider map so an unexpected element surfaces as a real symbol rather than "X".
+# Must cover every element in preprocess_stm.STM_TYPES.
 ATOMIC_SYMBOLS = {
     1: 'H', 2: 'He', 3: 'Li', 4: 'Be', 5: 'B', 6: 'C', 7: 'N', 8: 'O', 9: 'F',
     10: 'Ne', 11: 'Na', 12: 'Mg', 13: 'Al', 14: 'Si', 15: 'P', 16: 'S', 17: 'Cl',
     18: 'Ar', 19: 'K', 20: 'Ca', 35: 'Br', 53: 'I',
 }
 
-# --- REUSE: datasets/qm9s_dataset.py:206-207 (minus F, which TERS does not contain) -------
-TYPES = {1: 0, 6: 1, 7: 2, 8: 3}          # atomic number -> node feature index
+# Atomic number -> node index; order must match the ``ters_hcno`` atom_encoder.
+TYPES = {1: 0, 6: 1, 7: 2, 8: 3}
 
-# Candidate HDF5 key names, tried in order.  The Multimodal-ters converter is not mounted
-# where this was written, so the exact names are probed rather than assumed; --inspect
-# prints the real ones.
+# H/C/N/O/F for QM9S; order must match the ``qm9_second_half`` atom_encoder.
+TYPES_HCNOF = {1: 0, 6: 1, 7: 2, 8: 3, 9: 4}
+ELEMENT_SETS = {'hcno': TYPES, 'hcnof': TYPES_HCNOF}
+
+# Candidate HDF5 dataset names, tried in order.
 ATOM_Z_KEYS = ('atomic_numbers', 'atomic_number', 'atom_types', 'Z', 'species')
 ATOM_POS_KEYS = ('atom_positions', 'atom_pos', 'positions', 'coordinates', 'coords', 'xyz')
 
 
 def build_xyz_block(atomic_numbers, atom_pos):
-    """ADAPT of Multimodal-ters/scripts/npz_to_hdf5_converter.py:90-95.
-
-    Unchanged except for the consumer: in MT this feeds ``molecule_circular_image``;
-    here it feeds ``Chem.MolFromXYZBlock``.
-    """
+    """Return an XYZ-format string for ``Chem.MolFromXYZBlock``."""
     t = list(zip(atomic_numbers, atom_pos))
     text = f"{len(t)}\nComment\n"
     for atom, pos in t:
@@ -84,11 +55,12 @@ def build_xyz_block(atomic_numbers, atom_pos):
     return text
 
 
-# Cordero (2008) covalent radii in Angstrom -- the same values ``ase.data.covalent_radii``
-# carries, vendored for H/C/N/O so this script runs in environments without ``ase`` (the im2g
-# venv has rdkit but not ase). ASE is still preferred when importable so that a dataset
-# containing an unexpected element is handled rather than rejected.
-_COVALENT_RADII_HCNO = {1: 0.31, 6: 0.76, 7: 0.71, 8: 0.66}
+# Cordero (2008) covalent radii in Angstrom, as in ``ase.data.covalent_radii``; used without ase.
+_COVALENT_RADII = {
+    1: 0.31, 6: 0.76, 7: 0.71, 8: 0.66,                       # H, C, N, O
+    9: 0.57, 14: 1.11, 15: 1.07, 16: 1.05, 17: 1.02, 35: 1.20,  # F, Si, P, S, Cl, Br
+}
+_COVALENT_RADII_HCNO = _COVALENT_RADII      # backward-compatible alias
 
 
 def _covalent_radius(z):
@@ -97,22 +69,17 @@ def _covalent_radius(z):
         return float(covalent_radii[int(z)])
     except ImportError:
         try:
-            return _COVALENT_RADII_HCNO[int(z)]
+            return _COVALENT_RADII[int(z)]
         except KeyError:
             raise ImportError(
                 f'covalent radius for Z={int(z)} needs `pip install ase` -- only '
-                f'{sorted(_COVALENT_RADII_HCNO)} are vendored') from None
+                f'{sorted(_COVALENT_RADII)} are vendored') from None
 
 
 def covalent_bond_fallback(mol, atomic_numbers, atom_pos, tolerance=1.15):
-    """ADAPT of Multimodal-ters/src/datasets/ters_image_to_image_sh.py:160-174.
+    """Bond atoms closer than ``tolerance`` times the sum of their covalent radii.
 
-    MT's loop collects a ``set`` of ``(Z_i, Z_j)`` pairs; we need the loop body, not its
-    return value, so this returns index pairs instead and writes them onto ``mol``.
-
-    Connectivity only -- every bond is assigned order 1.  Molecules that go down this path
-    have meaningless bond orders, so SMILES exact-match is not a valid metric for them.
-    That is why ``used_fallback`` is recorded per molecule.
+    Every bond is single, so bond orders from this path are not meaningful.
     """
     from rdkit import Chem
 
@@ -132,10 +99,9 @@ def covalent_bond_fallback(mol, atomic_numbers, atom_pos, tolerance=1.15):
 
 
 def mol_from_geometry(atomic_numbers, atom_pos, allow_fallback=True, charge=0):
-    """Geometry -> kekulized RDKit Mol.  Returns ``(mol, used_fallback, n_aromatic)``.
+    """Infer bonds from geometry. Returns ``(mol, used_fallback, n_aromatic)``.
 
-    ``n_aromatic`` is counted *before* kekulization -- it feeds the
-    ``include_aromatic`` decision in docs/04-phase0-measurements.md.
+    ``mol`` is kekulized; ``n_aromatic`` counts aromatic bonds before kekulization.
     """
     from rdkit import Chem
     from rdkit.Chem import rdDetermineBonds
@@ -159,26 +125,21 @@ def mol_from_geometry(atomic_numbers, atom_pos, allow_fallback=True, charge=0):
     n_aromatic = sum(1 for b in mol.GetBonds()
                      if b.GetBondType() == Chem.BondType.AROMATIC)
 
-    # Kekulize, or aromatic rings vanish silently: EdgeComSpectraTransform maps bond type
-    # 4 -> 0 (datasets/build_dataset.py:120-122) when include_aromatic=False, which zeroes
-    # the feature, which zeroes the *existence* channel at line 138.  An aromatic bond
-    # becomes no bond at all, with no error.  QM9's SDF is pre-kekulized; DetermineBonds
-    # output is not.
+    # EdgeComSpectraTransform(include_aromatic=False) erases aromatic bonds; kekulize first.
     Chem.Kekulize(mol, clearAromaticFlags=True)
     return mol, used_fallback, n_aromatic
 
 
-def encode_graph(mol, h5_index):
-    """REUSE of the encoding convention at datasets/qm9s_dataset.py:226-260.
+def encode_graph(mol, h5_index, types=None):
+    """Encode a kekulized Mol as a graph record in the ``QM9S.process`` format.
 
-    Deviation from docs/03-execution-plan.md: ``fc`` carries RDKit's assigned formal
-    charges rather than zeros.  The HDF5 has none, but DetermineBonds assigns them (nitro
-    groups, N-oxides), and ``fc`` is a real feature channel consumed by
-    CollateSpectra.__call__ (datasets/build_dataset.py:430) -- zeroing it would train the
-    model to predict a charge state the target molecule does not have.
+    ``types`` maps atomic number to node index (default ``TYPES``); other elements raise
+    ``ValueError``.
     """
     from rdkit import Chem
     from rdkit.Chem.rdchem import BondType as BT
+
+    types = TYPES if types is None else types
 
     bonds = {BT.SINGLE: 1, BT.DOUBLE: 2, BT.TRIPLE: 3, BT.AROMATIC: 4}  # 0 -> no edge
 
@@ -188,9 +149,10 @@ def encode_graph(mol, h5_index):
     type_idx, charges, formal_charges = [], [], []
     for atom in mol.GetAtoms():
         z = atom.GetAtomicNum()
-        if z not in TYPES:
-            raise ValueError(f'element Z={z} outside the H/C/N/O set')
-        type_idx.append(TYPES[z])
+        if z not in types:
+            raise ValueError(
+                f'element Z={z} outside the configured set {sorted(types)}')
+        type_idx.append(types[z])
         charges.append(z)
         formal_charges.append(atom.GetFormalCharge())
 
@@ -232,7 +194,7 @@ def _pick_key(h5, candidates, what):
 
 
 def inspect(h5_path):
-    """Print the file layout.  Run this before the first real pass."""
+    """Print the HDF5 layout."""
     import h5py
     with h5py.File(h5_path, 'r') as f:
         print(f'{h5_path}')
@@ -249,20 +211,9 @@ def inspect(h5_path):
 def _numeric_group_accessor(node, what):
     """Return ``(length, getter)`` for a per-molecule HDF5 node.
 
-    Two layouts occur in the wild and they index differently:
-
-    * **Dense dataset** ``(N, max_atoms)`` -- ``node[i]`` works, padded with Z=0.
-    * **Group of per-molecule datasets** keyed ``'0'..'N-1'`` (what the real planar TERS
-      files use) -- ``node[i]`` raises ``TypeError``; the key must be a *string*.
-
-    The group case is where a silent-corruption bug lives.  ``h5py`` returns group keys in
-    **lexicographic** order -- ``'0', '1', '10', '100', '101', ...`` -- so pairing
-    ``enumerate(node.keys())`` with a cube index binds nearly every graph to the wrong
-    cube, with no error anywhere.  Verified against the real file: keys sort as
-    ``0,1,10,100`` but the cube at dense index ``i`` belongs to group key ``str(i)``
-    (confirmed by matching each cube's live frequency channels to that molecule's
-    vibrational modes, and each ``targets`` disc to its atom).  So this indexes by
-    ``str(i)`` and never iterates ``.keys()``.
+    Supports a dense ``(N, max_atoms)`` dataset padded with Z=0, or a group of datasets keyed
+    ``'0'..'N-1'`` and indexed by ``str(i)``. Do not enumerate ``.keys()``: h5py returns them
+    in lexicographic order, which pairs graphs with the wrong cubes.
     """
     import h5py
     if isinstance(node, h5py.Group):
@@ -282,14 +233,9 @@ def _numeric_group_accessor(node, what):
 
 
 def iter_molecules(h5, z_key, pos_key):
-    """Yield ``(index, atomic_numbers, positions)``, stripping zero padding.
+    """Yield ``(index, atomic_numbers, positions)`` with zero padding removed.
 
-    ``index`` is the dense cube index: the molecule yielded as ``i`` is the one whose
-    conditioning cube is ``channels_*[i]``.  See ``_numeric_group_accessor`` for why that
-    is not the same as enumerating group keys.
-
-    Handles both a ragged group layout and a dense ``(N, max_atoms)`` layout padded with
-    zeros -- Z=0 is not a real element, so it is an unambiguous padding marker.
+    ``index`` is the cube index: molecule ``i`` is conditioned on ``channels_*[i]``.
     """
     nz, get_z = _numeric_group_accessor(h5[z_key], z_key)
     npos, get_p = _numeric_group_accessor(h5[pos_key], pos_key)
@@ -307,14 +253,10 @@ def iter_molecules(h5, z_key, pos_key):
         yield i, z[keep], p[keep]
 
 
-# --- Phase 0 geometry statistics (folded in -- same data pass, no extra cost) -------------
+# --- Geometry statistics ----------------------------------------------------------------
 
 def geometry_stats(records):
-    """Produce the geometry rows of docs/04-phase0-measurements.md.
-
-    Centres each molecule the way losses.py:463 does at train time, so the radii reported
-    here are the ones ``model.normalize_factors[0]`` actually has to normalise.
-    """
+    """Summarise molecule geometry: size, element counts, and nearest-neighbour and bond lengths."""
     radii, nn_dists, z_abs, n_atoms, bond_lens = [], [], [], [], []
     elements = Counter()
 
@@ -332,10 +274,6 @@ def geometry_stats(records):
             np.fill_diagonal(d, np.inf)
             nn_dists.extend(d.min(axis=1).tolist())
 
-        # The actual bonded distances, not a proxy for them.  The cutoff below has to keep
-        # every one of these, and the nearest-neighbour distance systematically understates
-        # the longest bond: an atom's nearest neighbour is usually an H at ~1.0 A, while the
-        # longest bond in the same molecule is a C-C at ~1.6 A.
         ei = r['edge_index'].numpy()
         if ei.size:
             bond_lens.extend(np.linalg.norm(pos[ei[0]] - pos[ei[1]], axis=-1).tolist())
@@ -343,17 +281,6 @@ def geometry_stats(records):
     radii, nn_dists = np.array(radii), np.array(nn_dists)
     p95_radius = float(np.percentile(radii, 95))
     p95_nn = float(np.percentile(nn_dists, 95))
-    # Round the longest real bond UP to the next 0.1 A.  Measured on the real planar file the
-    # longest bond is 1.601 A, and `p95_nn + 0.2` gives 1.600 -- short by a thousandth, which
-    # would silently drop the single longest bond in the corpus.  Bonds are what this
-    # adjacency is for, so measure them.
-    max_bond = float(np.max(bond_lens)) if bond_lens else float(p95_nn + 0.2)
-    desired_cutoff = round(math.ceil(max_bond * 10 + 1e-9) / 10, 2)
-
-    # normalize_factors[0]: the divisor that lands the p95 radius near 1.0.  Floor of 2
-    # per docs/04-phase0-measurements.md -- TERS molecules sit in an ~18 A field of view
-    # and are larger than the QM9 set pos_norm=1 was tuned on.
-    _pos_norm = max(2, int(round(p95_radius)))
 
     return dict(
         n_molecules=len(records),
@@ -367,43 +294,23 @@ def geometry_stats(records):
         bond_length=dict(n=len(bond_lens),
                          median=float(np.median(bond_lens)) if bond_lens else None,
                          max=float(np.max(bond_lens)) if bond_lens else None),
-        # normalize_factors[0]: pick the divisor that lands the p95 radius near 1.0.
-        # Floor of 2 per the decision in docs/04-phase0-measurements.md -- TERS molecules
-        # sit in an 18 A box and are larger than the QM9 set pos_norm=1 was tuned on.
-        suggested_pos_norm=_pos_norm,
-        # spatial_cut_off is compared against a squared distance (models/utils.py:118-126)
-        # computed on the *normalised* coordinates -- utils.py:56 does `pos = pos / pos_norm`
-        # before the model ever sees them.  So the threshold is in units of
-        # (angstrom / pos_norm)**2, NOT angstrom**2.  Upstream QM9 hides this because its
-        # pos_norm is 1, where the two coincide; at pos_norm=6 they differ by 36x.
-        # Getting this wrong does not crash -- it silently makes `adj_spatial` all-ones,
-        # i.e. a constant feature.  Measured on the real planar file: 2.56 (the angstrom**2
-        # answer) marks 97.3% of all atom pairs adjacent; the value below marks 9.9% and
-        # still keeps 100% of RDKit bonds.
-        suggested_spatial_cut_off=round((desired_cutoff / _pos_norm) ** 2, 4),
-        suggested_spatial_cut_off_angstrom=desired_cutoff,
-        suggested_spatial_cut_off_note=(
-            f'squared, in units of (A / pos_norm={_pos_norm}); '
-            f'equals {desired_cutoff:.2f} A in real space'),
     )
 
 
-def check_record(rec, expect_aromatic_free=True):
-    """Assert an encoded record is well formed. Raises AssertionError with a reason.
+def check_record(rec, expect_aromatic_free=True, types=None):
+    """Assert that an encoded record is well formed and every edge survives the transform.
 
-    The last check is the important one: it pushes the record through the *real*
-    ``EdgeComSpectraTransform`` and confirms the number of existing edges survives. That is
-    the direct test for the aromatic trap (docs/05-progress-log.md D-4) -- a bond type 4
-    reaching the transform is silently erased, so an aromatic molecule would come out of
-    this check with fewer edges than it has bonds.
+    Returns a note saying whether the ``EdgeComSpectraTransform`` check ran.
     """
+    types = TYPES if types is None else types
     n = int(rec['num_atom'])
     ei, et = rec['edge_index'], rec['edge_type']
 
     assert rec['pos'].shape == (n, 3), f"pos {tuple(rec['pos'].shape)} != ({n}, 3)"
     assert rec['atom_type'].shape == (n,), 'atom_type length != num_atom'
     assert rec['fc'].shape == (n,), 'fc length != num_atom'
-    assert int(rec['atom_type'].max()) < len(TYPES), 'atom_type index outside H/C/N/O'
+    assert int(rec['atom_type'].max()) < len(types), \
+        f'atom_type index outside the configured {len(types)}-element set'
     assert ei.shape[1] == et.shape[0], 'edge_index and edge_type disagree'
     assert ei.shape[1] % 2 == 0, 'odd edge count -- edges must be stored both directions'
     assert int(ei.max()) < n if ei.numel() else True, 'edge_index refers to a missing atom'
@@ -411,10 +318,9 @@ def check_record(rec, expect_aromatic_free=True):
     if expect_aromatic_free:
         assert int(et.max()) <= 3 if et.numel() else True, \
             'bond type 4 (aromatic) survived kekulization -- it would be erased by ' \
-            'EdgeComSpectraTransform (datasets/build_dataset.py:120-122)'
+            'EdgeComSpectraTransform'
 
-    # (row * N + col) ordering, per datasets/qm9s_dataset.py:258
-    keys = (ei[0] * n + ei[1]).tolist()
+    keys =(ei[0] * n + ei[1]).tolist()
     assert keys == sorted(keys), 'edges are not sorted by (row * N + col)'
 
     try:
@@ -425,9 +331,8 @@ def check_record(rec, expect_aromatic_free=True):
 
     data = Data(atom_type=rec['atom_type'], pos=rec['pos'], fc=rec['fc'],
                 edge_index=ei, edge_type=et)
-    # atom_type stores indices, so the list is the encoder's *values* --
-    # matches the call site at datasets/build_dataset.py:24
-    data = EdgeComSpectraTransform(list(range(len(TYPES))), include_aromatic=False)(data)
+    # atom_type holds indices, so pass the encoder's values, as get_dataset does
+    data = EdgeComSpectraTransform(list(range(len(types))), include_aromatic=False)(data)
 
     n_exist = int(data.edge_one_hot[..., 0].sum())
     assert n_exist == ei.shape[1], (
@@ -438,17 +343,11 @@ def check_record(rec, expect_aromatic_free=True):
 
 
 def self_test():
-    """Exercise the RDKit half end-to-end with no HDF5 and no cluster.
-
-    Exists because the TERS data is not mounted where this was written
-    (docs/05-progress-log.md D-1, D-2). Run it first on the cluster: if it fails, the
-    problem is the environment or the port, not the data.
-    """
+    """Run the RDKit pipeline end to end on synthetic molecules; needs no data."""
     from rdkit import Chem, RDLogger
     from rdkit.Chem import AllChem
     RDLogger.DisableLog('rdApp.*')
 
-    # Benzene is the case that matters: it is the molecule the aromatic trap destroys.
     cases = [('methane', 'C'), ('ethanol', 'CCO'), ('benzene', 'c1ccccc1'),
              ('pyridine', 'c1ccncc1'), ('nitromethane', 'C[N+](=O)[O-]'),
              ('acetic acid', 'CC(=O)O')]
@@ -479,17 +378,42 @@ def self_test():
             print(f'  {name:14s} FAILED  {type(exc).__name__}: {exc}')
             failed += 1
 
+    # Fluorine must encode under TYPES_HCNOF and raise under the default TYPES.
+    for name, smiles in [('fluoromethane', 'CF'), ('trifluoroethanol', 'OCC(F)(F)F')]:
+        try:
+            ref = Chem.AddHs(Chem.MolFromSmiles(smiles))
+            AllChem.EmbedMolecule(ref, randomSeed=0xC0FFEE)
+            AllChem.MMFFOptimizeMolecule(ref)
+            z = [a.GetAtomicNum() for a in ref.GetAtoms()]
+            mol, _, _ = mol_from_geometry(z, ref.GetConformer().GetPositions())
+            rec = encode_graph(mol, h5_index=-1, types=TYPES_HCNOF)
+            check_record(rec, types=TYPES_HCNOF)
+            n_f = int((rec['atom_type'] == TYPES_HCNOF[9]).sum())
+            try:
+                encode_graph(mol, h5_index=-1)
+                rejected = False
+            except ValueError:
+                rejected = True
+            ok = n_f == smiles.count('F') and rejected
+            print(f'  {name:14s} {rec["num_atom"]:3d} atoms  F={n_f}  '
+                  f'hcnof=ok  hcno={"rejected" if rejected else "ACCEPTED"}'
+                  f'{"" if ok else "  FAILED"}')
+            failed += not ok
+        except Exception as exc:
+            print(f'  {name:14s} FAILED  {type(exc).__name__}: {exc}')
+            failed += 1
+
     print(f'\n{note}')
     print('self-test: ' + ('all cases passed' if not failed else f'{failed} case(s) failed'))
     return failed
 
 
 def process_split(h5_path, out_path, z_key=None, pos_key=None, charge=0,
-                  allow_fallback=True, want_stats=False, check=True):
-    """Build one sidecar. Returns a summary dict for the aggregate report."""
+                  allow_fallback=True, want_stats=False, check=True, types=None):
+    """Build one sidecar and return a summary dict; ``types`` defaults to ``TYPES``."""
     import h5py
     from rdkit import RDLogger
-    RDLogger.DisableLog('rdApp.*')   # mirrors datasets/qm9s_dataset.py:198
+    RDLogger.DisableLog('rdApp.*')
 
     with h5py.File(h5_path, 'r') as f:
         z_key = z_key or _pick_key(f, ATOM_Z_KEYS, 'atomic-number')
@@ -503,9 +427,9 @@ def process_split(h5_path, out_path, z_key=None, pos_key=None, charge=0,
             try:
                 mol, used_fallback, n_aromatic = mol_from_geometry(
                     z, pos, allow_fallback=allow_fallback, charge=charge)
-                rec = encode_graph(mol, h5_index=idx)
+                rec = encode_graph(mol, h5_index=idx, types=types)
                 if check:
-                    check_record(rec)
+                    check_record(rec, types=types)
             except Exception as exc:
                 failures.append(dict(h5_index=idx, n_atoms=int(len(z)),
                                      error=f'{type(exc).__name__}: {exc}'))
@@ -530,11 +454,9 @@ def process_split(h5_path, out_path, z_key=None, pos_key=None, charge=0,
             json.dump(failures, fh, indent=2)
         print(f'  failures           {fail_path}')
 
-    # Decision rule from docs/04-phase0-measurements.md: below ~90% survival, the fallback
-    # is doing too much work to trust bond orders across the corpus.
     if survival < 0.90:
-        print('  WARNING: survival below 90%. Revisit the fallback / --charge before '
-              'training -- see docs/04-phase0-measurements.md.')
+        print('  WARNING: survival below 90%. Check --charge and the covalent-radius '
+              'fallback rate before training.')
 
     summary = dict(split=osp.basename(h5_path), n_total=total, n_kept=len(records),
                    survival_rate=survival, n_fallback=n_fallback,
@@ -565,13 +487,17 @@ def main():
     ap.add_argument('--z-key', help='override the atomic-number dataset name')
     ap.add_argument('--pos-key', help='override the coordinate dataset name')
     ap.add_argument('--charge', type=int, default=0, help='total charge for DetermineBonds')
+    ap.add_argument('--elements', choices=sorted(ELEMENT_SETS), default='hcno',
+                    help='element set for the node types: hcno (planar TERS, default) or '
+                         'hcnof (QM9S). Must match data.atom_types / data.info_name.')
     ap.add_argument('--no-fallback', action='store_true',
                     help='drop molecules DetermineBonds fails on instead of using '
                          'covalent-radius connectivity')
     ap.add_argument('--no-check', action='store_true',
                     help='skip the per-record well-formedness check (faster)')
     ap.add_argument('--stats', action='store_true',
-                    help='also write the Phase 0 geometry rows as JSON')
+                    help='also write geometry statistics as JSON and print suggested '
+                         'config values')
     ap.add_argument('--inspect', action='store_true', help='print the HDF5 layout and exit')
     ap.add_argument('--self-test', action='store_true',
                     help='run the pipeline on synthetic molecules; needs no data')
@@ -587,7 +513,7 @@ def main():
 
     common = dict(z_key=args.z_key, pos_key=args.pos_key, charge=args.charge,
                   allow_fallback=not args.no_fallback, want_stats=args.stats,
-                  check=not args.no_check)
+                  check=not args.no_check, types=ELEMENT_SETS[args.elements])
 
     if args.data_dir:
         summaries = []
@@ -610,8 +536,7 @@ def main():
     if not summaries:
         return
 
-    # The follow-on table in docs/04-phase0-measurements.md, ready to paste.
-    print('--- Phase 0 follow-on (docs/04-phase0-measurements.md) ---')
+    print('--- Per-split summary ---')
     print(f'{"split":12s} {"kept/total":>14s} {"survival":>9s} {"fallback":>9s} '
           f'{"aromatic":>9s}')
     for s in summaries:
@@ -623,12 +548,6 @@ def main():
         geo = [s['geometry'] for s in summaries if 'geometry' in s]
         if geo:
             print('\nSuggested config values (take the max across splits):')
-            print(f'  model.normalize_factors[0]  = '
-                  f'{max(g["suggested_pos_norm"] for g in geo)}')
-            pn = max(g['suggested_pos_norm'] for g in geo)
-            cut = max(g['suggested_spatial_cut_off_angstrom'] for g in geo)
-            print(f'  model.spatial_cut_off       = {round((cut / pn) ** 2, 4)}'
-                  f'   ({cut} A, SQUARED -- models/utils.py:118-126)')
             print(f'  data.max_node               = '
                   f'{max(g["n_atoms"]["max"] for g in geo)}')
             elements = sorted({z for g in geo for z in map(int, g['elements'])})

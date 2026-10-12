@@ -24,10 +24,9 @@ def get_config():
     data.atom_types = 5                  # H/C/N/O/F; must match data.info_name
     data.max_node = 29                   # max atoms per molecule; not read
 
-    # Position divisor = max(2, round(p95 centred radius in A)), from preprocess_ters --stats.
-    model.normalize_factors = '5, 4, 4, 1'
-    # Squared distance in (A / pos_norm) units: (1.9 / 5)**2, above the longest bond.
-    model.spatial_cut_off = 0.1444
+    # Same as upstream DiffSpectra; spatial_cut_off is a squared distance in A^2.
+    model.normalize_factors = '1, 4, 4, 1'
+    model.spatial_cut_off = 2.0
 
     # Keep n_iters a multiple of snapshot_freq and begin/end_ckpt = n_iters // snapshot_freq.
     training.n_iters = 150000 // training.num_gpus

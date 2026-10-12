@@ -52,7 +52,7 @@ def get_config():
     model.name = 'DMT'
     model.pred_data = True
     model.include_fc_charge = True
-    model.normalize_factors = '6, 4, 4, 1'
+    model.normalize_factors = '1, 4, 4, 1'
     model.ema_decay = 0.999
     model.edge_ch = 2
     model.nf = 256
@@ -68,7 +68,7 @@ def get_config():
     model.n_extra_heads = 2
     model.CoM = True
     model.mlp_ratio = 2
-    model.spatial_cut_off = 0.09
+    model.spatial_cut_off = 2.0
     model.softmax_inf = True
     model.trans_name = 'TransMixLayer'
     model.cond_ch = 1

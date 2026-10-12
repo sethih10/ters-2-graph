@@ -16,7 +16,6 @@ def get_config():
     data.info_name = 'qm9_second_half'   # H/C/N/O/F
     data.atom_types = 5                  # must match the main config
     data.max_node = 29                   # max atoms per molecule; not read
-    config.model.normalize_factors = '5, 4, 4, 1'   # not read on this path
     config.eval.num_samples = 6279
 
     return config

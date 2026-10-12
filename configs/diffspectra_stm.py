@@ -58,8 +58,8 @@ def get_config():
     model.name = 'DMT'
     model.pred_data = True
     model.include_fc_charge = True       # fc holds RDKit formal charges from preprocess_stm
-    # First entry: position divisor ~ p95 centred radius (A); spatial_cut_off scales with it.
-    model.normalize_factors = '7, 4, 4, 1'
+    # Same as upstream DiffSpectra: positions stay in Angstrom.
+    model.normalize_factors = '1, 4, 4, 1'
     model.ema_decay = 0.999
     model.edge_ch = 2
     model.nf = 256                       # must equal the encoder output_dim
@@ -76,8 +76,8 @@ def get_config():
     model.n_extra_heads = 2
     model.CoM = True
     model.mlp_ratio = 2
-    # Squared distance in (A / pos_norm) units: (2.5 / 7)**2, above the longest bond.
-    model.spatial_cut_off = 0.1276
+    # Squared distance in A^2, as in upstream DiffSpectra.
+    model.spatial_cut_off = 2.0
     model.softmax_inf = True
     model.trans_name = 'TransMixLayer'
     model.cond_ch = 1

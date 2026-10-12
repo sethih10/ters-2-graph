@@ -231,9 +231,7 @@ def process_split(h5_path, out_path, split=None, charge=0, allow_fallback=True,
             json.dump(dict(summary, geometry=stats), fh, indent=2)
         print(f'  stats              {stats_path}')
         print(f'  elements kept      {stats["kept_elements"]}')
-        print(f'  max_node           {stats["suggested_max_node"]}   '
-              f'pos_norm {stats["suggested_pos_norm"]}   '
-              f'spatial_cut_off {stats["suggested_spatial_cut_off"]}')
+        print(f'  max_node           {stats["suggested_max_node"]}')
 
     return summary
 

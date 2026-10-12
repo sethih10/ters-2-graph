@@ -17,7 +17,6 @@ Usage
 """
 
 import argparse
-import math
 import json
 import os
 import os.path as osp
@@ -257,7 +256,7 @@ def iter_molecules(h5, z_key, pos_key):
 # --- Geometry statistics ----------------------------------------------------------------
 
 def geometry_stats(records):
-    """Summarise molecule geometry and suggest ``normalize_factors[0]`` and ``spatial_cut_off``."""
+    """Summarise molecule geometry: size, element counts, and nearest-neighbour and bond lengths."""
     radii, nn_dists, z_abs, n_atoms, bond_lens = [], [], [], [], []
     elements = Counter()
 
@@ -282,12 +281,6 @@ def geometry_stats(records):
     radii, nn_dists = np.array(radii), np.array(nn_dists)
     p95_radius = float(np.percentile(radii, 95))
     p95_nn = float(np.percentile(nn_dists, 95))
-    # Cutoff in Angstrom: the longest bond rounded up to 0.1 A, so it keeps every bond.
-    max_bond = float(np.max(bond_lens)) if bond_lens else float(p95_nn + 0.2)
-    desired_cutoff = round(math.ceil(max_bond * 10 + 1e-9) / 10, 2)
-
-    # Divisor that brings the p95 centred radius near 1.
-    _pos_norm = max(2, int(round(p95_radius)))
 
     return dict(
         n_molecules=len(records),
@@ -301,13 +294,6 @@ def geometry_stats(records):
         bond_length=dict(n=len(bond_lens),
                          median=float(np.median(bond_lens)) if bond_lens else None,
                          max=float(np.max(bond_lens)) if bond_lens else None),
-        suggested_pos_norm=_pos_norm,
-        # Units (A / pos_norm)**2: coord2diff_adj compares squared distances of scaled coords.
-        suggested_spatial_cut_off=round((desired_cutoff / _pos_norm) ** 2, 4),
-        suggested_spatial_cut_off_angstrom=desired_cutoff,
-        suggested_spatial_cut_off_note=(
-            f'squared, in units of (A / pos_norm={_pos_norm}); '
-            f'equals {desired_cutoff:.2f} A in real space'),
     )
 
 
@@ -562,12 +548,6 @@ def main():
         geo = [s['geometry'] for s in summaries if 'geometry' in s]
         if geo:
             print('\nSuggested config values (take the max across splits):')
-            print(f'  model.normalize_factors[0]  = '
-                  f'{max(g["suggested_pos_norm"] for g in geo)}')
-            pn = max(g['suggested_pos_norm'] for g in geo)
-            cut = max(g['suggested_spatial_cut_off_angstrom'] for g in geo)
-            print(f'  model.spatial_cut_off       = {round((cut / pn) ** 2, 4)}'
-                  f'   ({cut} A, squared; coord2diff_adj compares squared distances)')
             print(f'  data.max_node               = '
                   f'{max(g["n_atoms"]["max"] for g in geo)}')
             elements = sorted({z for g in geo for z in map(int, g['elements'])})

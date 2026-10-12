@@ -10,11 +10,8 @@ notebooks/
 .pytest_cache/
 .env
 .*
-!.gitignore
-
-assets/
-
 docs/
+
 
 tests/
 

@@ -8,7 +8,8 @@ from env import data_root
 
 
 QM9S_ROOT = data_root('QM9S-dataset', 'qm9s_hdf5_64px_5A')
-QM9S_GRAPHS = data_root('qm9s-ters', 'graphs')
+# Sidecars matching the rebuilt QM9S HDF5 row order.
+QM9S_GRAPHS = data_root('qm9s-ters', 'graphs_v3')
 
 
 def get_config():

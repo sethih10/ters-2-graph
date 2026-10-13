@@ -143,9 +143,18 @@ python main_finetune.py --mode eval  --workdir RUN \
 | `qm9s_ters_frozen.py` | DiffSpectra (H/C/N/O/F) | new |
 | `ters_frozen_p4.py` | a from-scratch planar TERS run | continued |
 
-The DiffSpectra checkpoint is expected at
-`DATA_ROOT/DiffSpectra/exp/allspectra_pretrained_specformer/checkpoints/checkpoint_40.pth`.
-To use another file, pass `--config.model.pretrained_denoiser_path=PATH`.
+The pretrained DiffSpectra checkpoint (`checkpoint_40.pth`, 793 MB, the
+all-spectra model with pretrained SpecFormer) is published on
+[Hugging Face](https://huggingface.co/AzureLeon1/DiffSpectra/tree/main/allspectra_pretrained_specformer/checkpoints).
+Download it to the path the configs expect:
+
+```bash
+mkdir -p $DATA_ROOT/DiffSpectra/exp/allspectra_pretrained_specformer/checkpoints
+wget -O $DATA_ROOT/DiffSpectra/exp/allspectra_pretrained_specformer/checkpoints/checkpoint_40.pth \
+    https://huggingface.co/AzureLeon1/DiffSpectra/resolve/main/allspectra_pretrained_specformer/checkpoints/checkpoint_40.pth
+```
+
+To use a file elsewhere, pass `--config.model.pretrained_denoiser_path=PATH`.
 
 - **Evaluate with `main_finetune.py` only.** The saved EMA covers only the trainable
   weights. `main.py`, `sample.py` and `run_metrics` would apply it to the wrong weights

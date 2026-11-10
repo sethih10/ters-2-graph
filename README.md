@@ -54,6 +54,7 @@ ters-2-graph/
 │   ├── dmt.py              # DMT denoiser (model.name = 'DMT'); builds the conditioning encoder
 │   ├── layers.py           # DMT attention and message-passing layers
 │   ├── ters_encoder.py     # TERS image encoder
+│   ├── ters_tokens/        # optional TERS token encoders (model.ters_encoder = token, token_xattn)
 │   ├── stm_encoder*.py     # STM image encoders (model.stm_encoder = v1, v2, clip)
 │   ├── specformer*.py      # DiffSpectra's 1D spectrum encoder, used when data.name = 'QM9S'
 │   ├── dmt_wo_eq.py        # DiffSpectra's non-equivariant DMT ablation (model.name = 'DMT_WO_EQ')
@@ -219,6 +220,10 @@ The output must be `(B, config.model.nf)`.
 
 The encoder is stored under `cond_encoder.`, so `main_finetune.py` trains a new encoder
 with no changes.
+
+[models/ters_tokens/README.md](models/ters_tokens/README.md) describes two optional TERS
+encoders added this way: a token encoder and the same encoder with cross-attention adapters
+in the DMT blocks.
 
 ### Add a config
 

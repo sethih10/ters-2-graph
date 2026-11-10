@@ -265,7 +265,11 @@ class DMT(nn.Module):
         _cond_kinds = {'TERS': 'ters', 'STM': 'stm'}
         self.cond_encoder_kind = _cond_kinds.get(config.data.name, 'specformer')
 
-        if self.cond_encoder_kind == 'ters':
+        ters_encoder = getattr(config.model, 'ters_encoder', 'v1')
+        if self.cond_encoder_kind == 'ters' and ters_encoder != 'v1':
+            from .ters_tokens import build_encoder
+            self.cond_encoder = build_encoder(config, self)
+        elif self.cond_encoder_kind == 'ters':
             self.cond_encoder = TersEncoder(
                 in_channels=config.model.ters_in_channels,
                 filters=tuple(getattr(config.model, 'ters_filters', (64, 128, 256, 512))),

@@ -56,8 +56,9 @@ def build_model(config):
     state.update({k: weights[k] for k in state if not k.startswith(skip)})
     model.load_state_dict(state)
 
+    freeze = getattr(config.model, 'freeze_denoiser', True)
     for name, p in model.named_parameters():
-        p.requires_grad_(name.startswith(TRAINABLE))
+        p.requires_grad_(not freeze or name.startswith(TRAINABLE))
     return model
 
 

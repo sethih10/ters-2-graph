@@ -110,8 +110,7 @@ class TersEncoder(nn.Module):
     def forward(self, x):
         if x.dim() != 4:
             raise ValueError(
-                f'TersEncoder expects (B, C, H, W), got {tuple(x.shape)}. The cube is '
-                f'permuted to channels-first in ImageGraphDataset.get.')
+                f'TersEncoder expects (B, C, H, W), got {tuple(x.shape)}.')
         if x.size(1) != self.in_channels:
             raise ValueError(
                 f'TersEncoder built for in_channels={self.in_channels} but got '

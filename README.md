@@ -1,5 +1,13 @@
 # TERS-2-Graph
 
+> **Known issues with the new HDF5 files (2026-11-12). Read before running a model.**
+>
+> 1. **Split leak.** About 76% of the new val and test molecules were in DiffSpectra's training
+>    split. Evaluating the frozen pretrained denoiser (`main_finetune.py`) on them overstates the
+>    scores. Training from scratch is unaffected.
+> 2. **`bonds='qm9'` is disabled**, so `configs/qm9s_ters_frozen.py` does not run. The files carry
+>    QM9S ids and `data_qm9.pt` is indexed by QM9 ids; a lookup has to be built from the old files.
+
 TERS-2-Graph generates a molecule (graph and 3D coordinates) from an image: a tip-enhanced Raman
 spectroscopy (TERS) image cube or a scanning tunnelling microscopy (STM) image stack. It adapts
 [DiffSpectra](https://github.com/AzureLeon1/DiffSpectra), replacing its 1D spectrum encoder with an

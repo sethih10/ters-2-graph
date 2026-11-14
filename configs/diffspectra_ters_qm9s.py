@@ -1,4 +1,4 @@
-"""DiffSpectra conditioned on QM9S-TERS images of shape (64, 64, 100).
+"""DiffSpectra conditioned on QM9S TERS maps, binned to (100, 64, 64).
 
 Pair with ``--config_original_qm9 configs/base_ters_qm9s.py``.
 """
@@ -10,9 +10,9 @@ import torch
 
 from env import data_root
 
-QM9S_ROOT = data_root('data', 'qm9s', 'hdf5_64px_5A')
-QM9S_CACHE = data_root('data', 'qm9s')                  # graphs are cached in <cache>/processed/
-QM9_SDF_GRAPHS = data_root('data', 'qm9s', 'diffspectra_processed', 'processed', 'data_qm9.pt')
+QM9S_ROOT = data_root('data')                           # graphs are cached in <root>/processed/
+STM_MEAN, STM_STD = -3.6043, 1.5612                     # Å, over 4000 training molecules
+QM9_SDF_GRAPHS = data_root('old', 'data', 'qm9s', 'diffspectra_processed', 'processed', 'data_qm9.pt')
 
 
 def get_config():
@@ -25,12 +25,15 @@ def get_config():
     config.data = data = ml_collections.ConfigDict()
     data.name = 'QM9'
     data.root = QM9S_ROOT                 # {train,val,test}.h5
-    data.image_key = 'channels_100'       # (N, 64, 64, 100)
-    data.normalize = 'per_channel'
-    data.cache_dir = QM9S_CACHE
+    data.modality = 'ters'                # 'ters' or 'stm'
+    data.bin_modes = True                 # TERS mode maps summed into 100 bins of 40 cm^-1
+    data.chn_mask = (24, 81)              # mode maps: modes kept in training (low, high); padded to high
+    data.normalize = 'per_channel'        # 'per_channel', 'log_relative' (mode maps) or 'corpus' (STM)
+    data.stm_mean = STM_MEAN              # used by normalize = 'corpus'
+    data.stm_std = STM_STD
+    data.cache_dir = QM9S_ROOT
     data.bonds = 'geometry'               # 'qm9' uses QM9's SDF graphs from data.qm9_path
     data.qm9_path = QM9_SDF_GRAPHS
-    data.smiles_root = ''                 # QM9S files carry their own SMILES
     data.load_images = True
     data.info_name = 'qm9_second_half'    # H/C/N/O/F; also selects the QM9 stability checks
     data.atom_types = 5                   # must match data.info_name
@@ -74,6 +77,8 @@ def get_config():
     model.softmax_inf = True
     model.trans_name = 'TransMixLayer'
     model.cond_ch = 1
+    model.ters_encoder = 'cnn'                 # 'cnn' or 'mode_fusion' (TERS mode maps)
+    model.ters_vit = 'tiny'                    # mode_fusion backbone: 'tiny' or 'small'
     model.ters_in_channels = 100               # must equal the image channels
     model.ters_filters = [64, 128, 256, 512]
     model.ters_pool_size = 4

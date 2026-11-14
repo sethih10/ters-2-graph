@@ -1,7 +1,7 @@
 """TERS encoder: mode maps and their wavenumbers -> SpmPatchEmbed tokens -> timm ViT -> (B, output_dim).
 
 Usage:
-    encoder = TersPanopticon.from_config(config, output_dim=256)
+    encoder = SpmEncoder.from_config(config, output_dim=256)
     z = encoder(dict(imgs=imgs, chn_ids=chn_ids, spec_masks=spec_masks))
     # imgs (B, M, 64, 64) mode maps, chn_ids (B, M) wavenumbers in cm^-1, spec_masks (B, M) True on
     # padding: a batch of datasets.augmentations.ChnPad outputs.
@@ -9,12 +9,12 @@ Usage:
 import timm
 from torch import nn
 
-from .panopticon import SpmPatchEmbed
+from .spm_patch_embed import SpmPatchEmbed
 
 VIT_MODELS = {'tiny': 'vit_tiny_patch16_224', 'small': 'vit_small_patch16_224'}
 
 
-class TersPanopticon(nn.Module):
+class SpmEncoder(nn.Module):
     """Mode maps (B, M, img_size, img_size) with their wavenumbers -> (B, output_dim).
 
     SpmPatchEmbed replaces the timm ViT's patch embedding, as in torchgeo (torchgeo/models/panopticon.py).

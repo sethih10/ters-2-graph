@@ -7,7 +7,7 @@ from .layers import *
 from torch_geometric.utils import dense_to_sparse
 from torch_scatter import scatter
 import functools
-from .spm_encoder import TersPanopticon
+from .spm_encoder import SpmEncoder
 from .ters_encoder import TersEncoder
 from .stm_encoder import StmEncoder
 from .stm_encoder_v2 import StmEncoderV2
@@ -19,7 +19,7 @@ def get_ters_encoder(config, output_dim):
     if config.model.ters_encoder == 'cnn':
         return TersEncoder.from_config(config, output_dim)
     if config.model.ters_encoder == 'mode_fusion':
-        return TersPanopticon.from_config(config, output_dim)
+        return SpmEncoder.from_config(config, output_dim)
     raise ValueError(f"model.ters_encoder must be 'cnn' or 'mode_fusion', got {config.model.ters_encoder!r}")
 
 

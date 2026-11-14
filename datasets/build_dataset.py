@@ -2,16 +2,16 @@
 
 import os.path as osp
 
-import h5py
 import torch
 import torch.nn.functional as F
 from rdkit import Chem
 from torch.utils.data import DataLoader, DistributedSampler
 from torchvision.transforms import v2
 
+from .augmentations import ChnPad, ListChnMask
 from .datasets_config import get_dataset_info
 from .image_dataset import ImageGraphDataset
-from .transforms import PerChannelNormalize, get_transforms
+from .transforms import BinModes, LogRelativeNormalize, PerChannelNormalize, get_transforms
 
 
 def get_dataset(config):
@@ -28,28 +28,38 @@ def get_dataset(config):
     if getattr(data, 'transforms', None):
         train.transform_image, val.transform_image = get_transforms(**data.transforms)
         test.transform_image = val.transform_image
+    mode_maps = data.modality == 'ters' and not data.bin_modes
+    if mode_maps != (config.model.ters_encoder == 'mode_fusion'):
+        raise ValueError("model.ters_encoder = 'mode_fusion' needs data.modality = 'ters' with "
+                         "data.bin_modes = False, and the other encoders need a fixed image")
+    if mode_maps:
+        low, high = data.chn_mask
+        train.chn_mask = ListChnMask(low, high)
+        for dataset in (train, val, test):
+            dataset.chn_pad = ChnPad(high)
     return train, train, val, test, info
 
 
 def _build_split(data, split, transform, atom_types):
-    h5_path = osp.join(data.root, f'{split}.h5')
-    smiles_path = None
-    if getattr(data, 'smiles_root', ''):
-        smiles_path = osp.join(data.smiles_root, f'{split}.h5')
-    return ImageGraphDataset(h5_path, data.cache_dir, data.image_key, atom_types, bonds=data.bonds,
-                             qm9_path=getattr(data, 'qm9_path', None), smiles_path=smiles_path,
-                             transform=transform, normalize=_get_normalizer(data, h5_path),
+    bin_modes = None
+    if data.modality == 'ters' and data.bin_modes:
+        bin_modes = BinModes()
+    return ImageGraphDataset(osp.join(data.root, f'{split}.h5'), data.cache_dir, data.modality, atom_types,
+                             bonds=data.bonds, qm9_path=getattr(data, 'qm9_path', None),
+                             transform=transform, normalize=_get_normalizer(data), bin_modes=bin_modes,
                              load_images=getattr(data, 'load_images', True))
 
 
-def _get_normalizer(data, h5_path):
-    """``data.normalize``: 'per_channel' (TERS), 'corpus' (one mean/std from the file's attributes, STM)."""
+def _get_normalizer(data):
+    """``data.normalize``: 'per_channel' (binned TERS), 'log_relative' (TERS mode maps), 'corpus' (STM,
+    one train-set mean and std)."""
     if data.normalize == 'per_channel':
         return PerChannelNormalize()
+    if data.normalize == 'log_relative':
+        return LogRelativeNormalize()
     if data.normalize == 'corpus':
-        with h5py.File(h5_path, 'r') as f:
-            return v2.Normalize(mean=[float(f.attrs['mean'])], std=[float(f.attrs['std'])])
-    raise ValueError(f"data.normalize must be 'per_channel' or 'corpus', got {data.normalize!r}")
+        return v2.Normalize(mean=[data.stm_mean], std=[data.stm_std])
+    raise ValueError(f"data.normalize must be 'per_channel', 'log_relative' or 'corpus', got {data.normalize!r}")
 
 
 def get_dataloader(train_ds, val_ds, test_ds, config):
@@ -108,6 +118,15 @@ class EdgeComSpectraTransform:
         return data
 
 
+def stack_context(items, image_attr='image'):
+    """Stack the items' images. Padded mode maps also carry their channel ids and padding masks."""
+    imgs = torch.stack([getattr(item, image_attr) for item in items])
+    if 'spec_masks' not in items[0]:
+        return imgs
+    return dict(imgs=imgs, chn_ids=torch.stack([item.chn_ids for item in items]),
+                spec_masks=torch.stack([item.spec_masks for item in items]))
+
+
 class Collate:
     """Pad molecules to the largest in the batch and stack their images into ``context``."""
 
@@ -125,7 +144,7 @@ class Collate:
             formal_charges=_pad_nodes([item.fc[:, None] for item in items], n),
             atom_mask=atom_mask,
             edge_mask=edge_mask.reshape(-1, 1),
-            context=torch.stack([getattr(item, self.image_attr) for item in items]),
+            context=stack_context(items, self.image_attr),
         )
 
 

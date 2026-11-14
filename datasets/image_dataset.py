@@ -1,13 +1,13 @@
-"""Molecule graphs paired with HDF5 images (QM9S-TERS, QM9-STM, planar TERS).
+"""Molecule graphs paired with the TERS maps or STM images of one HDF5 file per split.
 
-Each HDF5 file holds the images and every molecule's atoms and coordinates. Graphs are built once, like DiffSpectra's ``QM9S.process``, and cached in
-``<cache_dir>/processed/``; images are read from the HDF5 file on demand. ``bonds`` selects where
-the bonds come from:
+Each file holds every molecule's atoms, coordinates, SMILES, TERS mode maps and STM images. Graphs
+are built once, like DiffSpectra's ``QM9S.process``, and cached in ``<cache_dir>/processed/``; images
+are read from the HDF5 file on demand. ``bonds`` selects where the bonds come from:
 
-- ``'geometry'``: found from the HDF5 coordinates with RDKit, or taken from the molecule's SMILES
-  when that fails. Molecules without a valid neutral, closed-shell graph are dropped.
-- ``'qm9'``: DiffSpectra's ``data_qm9.pt`` (QM9's SDF), matched by the file's ``qm9_idx``. Needed to
-  fine-tune the pretrained DiffSpectra denoiser, which was trained on these graphs.
+- ``'geometry'``: found from the coordinates with RDKit, or taken from the molecule's SMILES when
+  that fails. Molecules without a valid neutral, closed-shell graph are dropped.
+- ``'qm9'``: DiffSpectra's ``data_qm9.pt`` (QM9's SDF). Needed to fine-tune the pretrained
+  DiffSpectra denoiser, which was trained on these graphs.
 """
 
 import multiprocessing
@@ -26,31 +26,43 @@ from torch_geometric.data import Data, InMemoryDataset
 QM9_ATOM_TYPES = {1: 0, 6: 1, 7: 2, 8: 3, 9: 4}       # H, C, N, O, F, the atom_type indices in data_qm9.pt
 BOND_TYPES = {Chem.BondType.SINGLE: 1, Chem.BondType.DOUBLE: 2, Chem.BondType.TRIPLE: 3}
 BOND_TOLERANCE = 0.1                                    # Å; a larger mismatch means a different molecule
+MODALITIES = ('ters', 'stm')
 
 
 class ImageGraphDataset(InMemoryDataset):
-    """One split. ``image_key`` names the ``(N, H, W, C)`` images in ``h5_path``; ``atom_types`` maps
-    atomic number to atom-type index.
+    """One split. ``modality`` selects the image and its channel ids:
 
-    ``smiles_path`` is a QM9S-TERS HDF5 file of the same split; QM9-STM files have no SMILES and
-    reach them through their ``ters_row``.
+    - ``'ters'``: one map per normal mode, ``(M, H, W)``, with wavenumbers in cm^-1. ``bin_modes``
+      turns them into a fixed ``(bins, H, W)`` cube; the channel ids are then dropped. Otherwise
+      ``chn_pad`` pads the maps to a fixed count and adds ``spec_masks``, True on padding.
+    - ``'stm'``: ``(11, H, W)`` tip heights in Å, with log10 of each setpoint current.
+
+    ``atom_types`` maps atomic number to atom-type index.
     """
 
     image_attr = 'image'
 
-    def __init__(self, h5_path, cache_dir, image_key, atom_types, bonds='geometry', qm9_path=None,
-                 smiles_path=None, transform=None, normalize=None, load_images=True):
+    def __init__(self, h5_path, cache_dir, modality, atom_types, bonds='geometry', qm9_path=None,
+                 transform=None, normalize=None, bin_modes=None, load_images=True):
+        if modality not in MODALITIES:
+            raise ValueError(f'modality must be one of {MODALITIES}, got {modality!r}')
         self.h5_path = h5_path
-        self.image_key = image_key
+        self.modality = modality
         self.atom_types = atom_types
         self.bonds = bonds
         self.qm9_path = qm9_path
-        self.smiles_path = smiles_path
         self.normalize = normalize
+        self.bin_modes = bin_modes
         self.load_images = load_images
         self.transform_image = None             # augmentation, set by build_dataset
+        self.chn_mask = None                    # ListChnMask for training, set by build_dataset
+        self.chn_pad = None                     # ChnPad, set by build_dataset
         self._hf = None                         # HDF5 handle, opened once per process
         self._pid = None
+        with h5py.File(h5_path, 'r') as f:
+            self.ters_ptr = f['ters_ptr'][:]
+            currents = f.attrs['stm_setpoints'][None, :] * f['stm_i_ref'][:][:, None]
+            self.stm_log_current = torch.from_numpy(np.log10(currents)).float()     # (N, 11)
         super().__init__(cache_dir, transform)
         self.load(self.processed_paths[0])
 
@@ -62,20 +74,17 @@ class ImageGraphDataset(InMemoryDataset):
     def process(self):
         RDLogger.DisableLog('rdApp.*')
         with h5py.File(self.h5_path, 'r') as f:
-            qm9_idx = None
-            if 'qm9_idx' in f:
-                qm9_idx = f['qm9_idx'][:]
+            qm9s_idx = f['qm9s_idx'][:]
+            smiles = list(f['smiles'].asstr()[:])
             molecules = _read_molecules(f)
-            smiles = _read_smiles(f, self.smiles_path, len(molecules))
 
         if self.bonds == 'geometry':
             arguments = zip(molecules, smiles, repeat(self.atom_types))
             with multiprocessing.Pool(len(os.sched_getaffinity(0))) as pool:
                 graphs = pool.starmap(_graph_from_geometry, arguments, chunksize=256)
         elif self.bonds == 'qm9':
-            if qm9_idx is None or self.atom_types != QM9_ATOM_TYPES:
-                raise ValueError("bonds='qm9' needs qm9_idx in the HDF5 file and the QM9 atom types")
-            graphs = _graphs_from_qm9(self.qm9_path, qm9_idx, molecules)
+            raise ValueError("bonds='qm9' is not available yet: the files carry QM9S ids, and "
+                             "data_qm9.pt is indexed by QM9 ids")
         else:
             raise ValueError(f"bonds must be 'geometry' or 'qm9', got {self.bonds!r}")
 
@@ -85,10 +94,7 @@ class ImageGraphDataset(InMemoryDataset):
                 continue
             for key in ('atom_type', 'charge', 'fc', 'edge_index', 'edge_type', 'pos'):
                 graph[key] = torch.from_numpy(graph[key])
-            graph['qm9_idx'] = -1
-            if qm9_idx is not None:
-                graph['qm9_idx'] = int(qm9_idx[row])
-            data_list.append(Data(**graph, h5_index=row))
+            data_list.append(Data(**graph, h5_index=row, qm9s_idx=int(qm9s_idx[row])))
         print(f'{self.h5_path}: kept {len(data_list)} of {len(graphs)} molecules')
         self.save(data_list, self.processed_paths[0])
 
@@ -99,12 +105,31 @@ class ImageGraphDataset(InMemoryDataset):
         if self._pid != os.getpid():
             self._hf = h5py.File(self.h5_path, 'r')
             self._pid = os.getpid()
-        image = torch.from_numpy(self._hf[self.image_key][int(data.h5_index)]).float().permute(2, 0, 1)
+        row = int(data.h5_index)
+        if self.modality == 'ters':
+            start, stop = self.ters_ptr[row], self.ters_ptr[row + 1]
+            image = torch.from_numpy(self._hf['ters_maps'][start:stop])
+            chn_ids = torch.from_numpy(self._hf['ters_wavenumbers'][start:stop])
+            if self.bin_modes is not None:
+                image = self.bin_modes(image, chn_ids)
+                chn_ids = None
+        else:
+            image = torch.from_numpy(self._hf['stm_images'][row]).float()
+            chn_ids = self.stm_log_current[row]
         if self.normalize is not None:
             image = self.normalize(image)
         if self.transform_image is not None:
             image = self.transform_image(image)
+        if self.chn_pad is not None:
+            channels = dict(imgs=[image], chn_ids=[chn_ids])
+            if self.chn_mask is not None:
+                channels = self.chn_mask(channels)
+            channels = self.chn_pad(dict(imgs=torch.cat(channels['imgs']), chn_ids=torch.cat(channels['chn_ids'])))
+            image, chn_ids = channels['imgs'], channels['chn_ids']
+            data.spec_masks = channels['spec_masks']
         data.image = image
+        if chn_ids is not None:
+            data.chn_ids = chn_ids
         return data
 
     def __getstate__(self):
@@ -115,27 +140,14 @@ class ImageGraphDataset(InMemoryDataset):
 
 
 def _read_molecules(f):
-    """Atomic numbers and positions (Å) per row: QM9-STM stores ``xyz``, TERS files one group per row."""
+    """Atomic numbers and positions (Å) of every molecule."""
+    ptr = f['atom_ptr'][:]
+    numbers = f['atomic_numbers'][:].astype(int)
+    positions = f['positions'][:].astype(np.float64)
     molecules = []
-    if 'xyz' in f:
-        for rows in f['xyz'][:]:
-            atoms = rows[:, 3] > 0
-            molecules.append((rows[atoms, 3].astype(int), rows[atoms, :3].astype(np.float64)))
-    else:
-        for i in range(len(f['atomic_numbers'])):
-            numbers = f['atomic_numbers'][str(i)][()].astype(int)
-            molecules.append((numbers, f['atom_positions'][str(i)][()].astype(np.float64)))
+    for start, stop in zip(ptr[:-1], ptr[1:]):
+        molecules.append((numbers[start:stop], positions[start:stop]))
     return molecules
-
-
-def _read_smiles(f, smiles_path, n):
-    if 'smiles' in f:
-        return list(f['smiles'].asstr()[:])
-    if smiles_path is None:
-        return [None] * n
-    with h5py.File(smiles_path, 'r') as g:
-        smiles = g['smiles'].asstr()[:]
-    return [smiles[row] for row in f['ters_row'][:]]
 
 
 def _graph_from_geometry(molecule, smiles, atom_types):

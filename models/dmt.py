@@ -7,10 +7,20 @@ from .layers import *
 from torch_geometric.utils import dense_to_sparse
 from torch_scatter import scatter
 import functools
+from .spm_encoder import TersPanopticon
 from .ters_encoder import TersEncoder
 from .stm_encoder import StmEncoder
 from .stm_encoder_v2 import StmEncoderV2
 from .stm_encoder_clip import StmCubeEncoder, load_pretrained_stm_cube_encoder
+
+
+def get_ters_encoder(config, output_dim):
+    """``model.ters_encoder``: 'cnn' (fixed image) or 'mode_fusion' (TERS mode maps with wavenumbers)."""
+    if config.model.ters_encoder == 'cnn':
+        return TersEncoder.from_config(config, output_dim)
+    if config.model.ters_encoder == 'mode_fusion':
+        return TersPanopticon.from_config(config, output_dim)
+    raise ValueError(f"model.ters_encoder must be 'cnn' or 'mode_fusion', got {config.model.ters_encoder!r}")
 
 
 def modulate(x, shift, scale):
@@ -267,7 +277,7 @@ class DMT(nn.Module):
         self.cond_encoder_kind = _cond_kinds[config.data.name]
 
         if self.cond_encoder_kind == 'ters':
-            self.cond_encoder = TersEncoder.from_config(config, hidden_dim)
+            self.cond_encoder = get_ters_encoder(config, hidden_dim)
         elif self.cond_encoder_kind == 'stm':
             stm_version = str(getattr(config.model, 'stm_encoder', 'v1')).lower()
             if stm_version not in ('v1', 'v2', 'clip'):
@@ -318,7 +328,7 @@ class DMT(nn.Module):
                 print("Load pretrained TersEncoder")
                 self.load_pretrained_ters_encoder(ters_ckpt)
             else:
-                print("Train TersEncoder from scratch")
+                print(f'Train {type(self.cond_encoder).__name__} from scratch')
         else:
             stm_ckpt = getattr(config.model, 'pretrained_stm_encoder_path', '')
             if stm_ckpt and self.stm_version != 'clip':

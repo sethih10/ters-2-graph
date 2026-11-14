@@ -16,10 +16,10 @@ from rdkit import Chem, RDLogger
 from rdkit.Chem import AllChem, DataStructs
 RDLogger.DisableLog('rdApp.*')
 
-from datasets import get_dataset
+from datasets import get_dataset, stack_context
 from models.ema import ExponentialMovingAverage
 from models import create_model
-from utils import get_data_inverse_scaler, get_self_cond_fn
+from utils import context_to, get_data_inverse_scaler, get_self_cond_fn
 from diffusion import NoiseScheduleVP
 from evaluation import get_2D_edm_metric
 from sampling import AncestralSampler, mol_process, sample_batch
@@ -212,7 +212,7 @@ def main():
         na = mol.num_atom
         n_at = int(na.item()) if torch.is_tensor(na) else int(na)
         for _ in range(args.n_samples):            # same cube, different initial noise
-            cubes.append(cube_mol.image)
+            cubes.append(cube_mol)
             n_nodes.append(n_at)
         truth.append(mol.rdmol)
     truth_graphs = [] if args.no_geometry else [ds[int(i)] for i in idx]
@@ -248,7 +248,7 @@ def main():
             f'flattened edge_mask by the xh batch size, so an uneven DataParallel split makes '
             f'the two disagree. The padding above should prevent this.')
         # (B, C, H, W), stacked as in build_dataset.Collate.
-        context = torch.stack(chunk_cubes, dim=0).to(config.device)
+        context = context_to(stack_context(chunk_cubes), config.device)
         pos, one_hot, fc, edge_types = sample_batch(model, sampler, context, cn, config,
                                                     inverse_scaler)
         # Drop the padding so the flat index stays mi * n_samples + si.

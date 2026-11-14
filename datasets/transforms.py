@@ -16,6 +16,32 @@ class PerChannelNormalize:
         return (image - mean) / std
 
 
+class LogRelativeNormalize:
+    """TERS mode maps: log10(image / max + FLOOR) - log10(FLOOR), divided by SIGMA. Zero without signal."""
+
+    FLOOR = 1e-3
+    SIGMA = 0.2626          # std of the log values over mode-map pixels of the training set
+
+    def __call__(self, image):
+        peak = image.max()
+        if peak <= 0:
+            return torch.zeros_like(image)
+        return torch.log1p(image / (peak * self.FLOOR)) / (math.log(10.0) * self.SIGMA)
+
+
+class BinModes:
+    """TERS: sum mode maps (M, H, W) into frequency bins of `width` cm^-1 -> (bins, H, W)."""
+
+    def __init__(self, bins=100, width=40.0):
+        self.bins = bins
+        self.width = width
+
+    def __call__(self, maps, wavenumbers):
+        index = (wavenumbers / self.width).long().clamp(max=self.bins - 1)
+        cube = torch.zeros(self.bins, *maps.shape[1:])
+        return cube.index_add_(0, index, maps)
+
+
 class StmNormalize:
     """STM: scale uint16 to [0, 1], compress bright pixels with asinh, standardise the whole stack."""
 

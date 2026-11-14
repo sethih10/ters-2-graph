@@ -13,7 +13,7 @@ from torch_scatter import scatter
 from torch_geometric.utils import dense_to_sparse
 from .layers import *
 from . import utils
-from .ters_encoder import TersEncoder
+from .dmt import get_ters_encoder
 # disable_compile = torch.cuda.get_device_name(0).find('AMD') >= 0
 
 
@@ -744,7 +744,7 @@ class DMT_WO_EQ(nn.Module):
             )
 
         # Image encoder; outputs (B, hidden_dim) for cond_lin, as in DMT.
-        self.cond_encoder = TersEncoder.from_config(config, hidden_dim)
+        self.cond_encoder = get_ters_encoder(config, hidden_dim)
         self.cond_lin = nn.Linear(hidden_dim, time_dim)
 
     def forward(self, t, xh, node_mask, edge_mask, context=None, *args, **kwargs):

@@ -508,7 +508,7 @@ def process_batch_2D(batch, device, include_charges, scaler):
         if type(batch['context']) is list:
             context = [spectra.to(device) for spectra in batch['context']]
         else:
-            context = batch['context'].to(device)
+            context = context_to(batch['context'], device)
     else:
         context = None
 
@@ -535,7 +535,7 @@ def process_edge_batch(batch, device, include_charges, scaler, prop_norm, model_
         if type(batch['context']) is list:
             context = [spectra.to(device) for spectra in batch['context']] # list of ([128, 1, 701], [128, 1, 3501], [128, 1, 3501])
         else:
-            context = batch['context'].to(device)  # [128, 1, 3501]
+            context = context_to(batch['context'], device)
     else:
         context = None
 

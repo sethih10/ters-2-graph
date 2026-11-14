@@ -8,7 +8,8 @@ import torch
 
 from models.utils import (sample_combined_position_feature_noise, assert_mean_zero_with_mask,
                           sample_symmetric_edge_feature_noise)
-from utils import get_self_cond_fn
+from datasets import stack_context
+from utils import context_to, get_self_cond_fn
 
 from .postprocess import mol_process, post_process
 from .samplers import AncestralSampler
@@ -47,19 +48,16 @@ def get_sampling_fn(config, noise_scheduler, batch_size, n_samples, inverse_scal
             for r in range(num_sampling_rounds):
                 sampled_val_mol_id= permute_val_mol_id[r * batch_size:(r + 1) * batch_size]
                 sampled_val_mol = []
-                sampled_cubes = []
                 n_nodes = []
                 for i in sampled_val_mol_id:
                     mol = val_ds[i]
                     sampled_val_mol.append(mol)
-                    if image_attr is not None:
-                        sampled_cubes.append(getattr(mol, image_attr))
                     sampled_val_pos.append(mol.pos)
                     sampled_val_rdkit_mols.append(mol.rdmol)
                     n_nodes.append(int(mol.num_atom))
                 
                 if image_attr is not None:
-                    context = torch.stack(sampled_cubes).to(device)  # (B, C, H, W)
+                    context = context_to(stack_context(sampled_val_mol, image_attr), device)
                 max_n_nodes = max(n_nodes)
                 n_batch = len(n_nodes)
                 
@@ -147,19 +145,16 @@ def get_cond_sampling_eval_fn(config, noise_scheduler, batch_size, n_samples, in
             for r in range(num_sampling_rounds):
                 sampled_test_mol_id= permute_test_mol_id[r * batch_size:(r + 1) * batch_size]
                 sampled_test_mol = []
-                sampled_cubes = []
                 n_nodes = []
                 for i in sampled_test_mol_id:
                     mol = test_ds[i]
                     sampled_test_mol.append(mol)
-                    if image_attr is not None:
-                        sampled_cubes.append(getattr(mol, image_attr))
                     sampled_test_pos.append(mol.pos)
                     sampled_test_rdkit_mols.append(mol.rdmol)
                     n_nodes.append(int(mol.num_atom))
                 
                 if image_attr is not None:
-                    context = torch.stack(sampled_cubes).to(device)  # (B, C, H, W)
+                    context = context_to(stack_context(sampled_test_mol, image_attr), device)
                 max_n_nodes = max(n_nodes)
                 n_batch = len(n_nodes)
 

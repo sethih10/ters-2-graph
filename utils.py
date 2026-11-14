@@ -4,6 +4,13 @@ import logging
 import numpy as np
 
 
+def context_to(context, device):
+    """Move the conditioning input, a tensor or a dict of tensors, to ``device``."""
+    if isinstance(context, dict):
+        return {key: value.to(device) for key, value in context.items()}
+    return context.to(device)
+
+
 def restore_checkpoint(ckpt_dir, state, device):
     if not os.path.exists(ckpt_dir):
         if not os.path.exists(os.path.dirname(ckpt_dir)):
